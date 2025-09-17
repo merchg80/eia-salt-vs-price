@@ -39,9 +39,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Check EIA_API_KEY presence
+        run: |
+          if [ -z "${{ secrets.EIA_API_KEY }}" ]; then
+            echo "EIA_API_KEY is NOT set. Add it in Settings → Secrets and variables → Actions."
+            exit 1
+          else
+            echo "EIA_API_KEY is present."
+          fi
+
       - name: Run report
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
           START="${{ github.event.inputs.start_date }}"
           END="${{ github.event.inputs.end_date }}"
