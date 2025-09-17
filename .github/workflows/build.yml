@@ -62,36 +62,33 @@ jobs:
           fi
           echo "EIA_API_KEY is present."
 
-      - name: Locate script and src (auto-detect)
+      - name: Locate script and src (prefer repo root; exclude .github)
         id: locate
         run: |
-          SCRIPT=""
-          # Prefer repo-root scripts/run_report.py
+          # Prefer repo-root scripts/run_report.py, otherwise find the first outside .github
           if [ -f scripts/run_report.py ]; then
             SCRIPT="scripts/run_report.py"
           else
-            # Search nested locations
-            SCRIPT=$(find . -maxdepth 5 -path "*/scripts/run_report.py" | head -n1 || true)
+            SCRIPT=$(find . -path "./.github" -prune -o -path "./.github/*" -prune -o -path "*/scripts/run_report.py" -print | head -n1 || true)
           fi
 
           if [ -z "$SCRIPT" ]; then
-            echo "ERROR: run_report.py not found in repo"; exit 1
+            echo "ERROR: run_report.py not found (expected at scripts/run_report.py)"; exit 1
           fi
 
           echo "Found script: $SCRIPT"
           echo "script_path=$SCRIPT" >> $GITHUB_OUTPUT
 
-          # Determine src directory for PYTHONPATH
-          SRCDIR1="src"
-          SRCDIR2="$(dirname "$SCRIPT")/../src"
-          # Prefer repo-root src if present
-          if [ -d "$SRCDIR1" ]; then
-            SRCDIR="$SRCDIR1"
-          elif [ -d "$SRCDIR2" ]; then
-            SRCDIR="$SRCDIR2"
+          # Determine src directory for PYTHONPATH (prefer repo-root src/)
+          if [ -d src ]; then
+            SRCDIR="src"
           else
-            echo "WARNING: src/ not found at repo root or adjacent to the script."
-            SRCDIR=""
+            CANDIDATE="$(dirname "$SCRIPT")/../src"
+            if [ -d "$CANDIDATE" ]; then
+              SRCDIR="$CANDIDATE"
+            else
+              SRCDIR=""
+            fi
           fi
           echo "Using SRCDIR: $SRCDIR"
           echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
@@ -103,7 +100,7 @@ jobs:
           SCRIPT="${{ steps.locate.outputs.script_path }}"
           SRCDIR="${{ steps.locate.outputs.src_path }}"
 
-          # Build PYTHONPATH
+          # Build PYTHONPATH so eia_storage_plot can be imported
           if [ -n "$SRCDIR" ]; then
             export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
           fi
