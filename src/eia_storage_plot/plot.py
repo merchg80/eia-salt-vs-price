@@ -2,18 +2,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import date
+from datetime import date, datetime
+from typing import Tuple
 
 
-def select_apr_oct_last5(df: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
+# ---------- Window selection ----------
+
+def select_apr_oct_last10_including_current(df: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
     """
-    Keep a continuous dataset for Apr–Oct for the last 5 *completed* years.
-    Example (today=2025-09-17): keep 2020–2024, months 4..10 inclusive.
+    Keep a continuous dataset for Apr–Oct for the last 10 years, INCLUDING the current year.
+    Example (today=2025-09-17): keep 2016–2025, months 4..10 inclusive.
     """
     if today is None:
         today = date.today()
-    end_year = today.year - 1
-    start_year = end_year - 4
+    end_year = today.year            # include current year
+    start_year = end_year - 9        # last 10 years inclusive
 
     d = df.copy()
     d["year"] = d["period"].dt.year
@@ -23,25 +26,70 @@ def select_apr_oct_last5(df: pd.DataFrame, today: date | None = None) -> pd.Data
     return d.sort_values("period").reset_index(drop=True)
 
 
-def _quad_fit(x: np.ndarray, y: np.ndarray):
+# ---------- Robust outlier trimming (bivariate) ----------
+
+def _mad(x: np.ndarray) -> float:
+    med = np.nanmedian(x)
+    return np.nanmedian(np.abs(x - med)) or 1.0
+
+def trim_outliers_bivariate(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    frac: float = 0.20,
+) -> pd.DataFrame:
     """
-    Fit y ~ a x^2 + b x + c. Return coefficients, yhat, and R^2.
+    Remove the top `frac` of points farthest from the robust center in standardized space.
+    Steps:
+      - Robust center = median(x), median(y)
+      - Scale: MAD for x and y
+      - Distance = sqrt(zx^2 + zy^2)
+      - Drop the largest `frac` quantile by distance
     """
-    # Guard: need at least 3 unique x for a quadratic fit
-    if len(np.unique(x)) < 3:
-        # Fallback to a flat line through mean
-        yhat = np.full_like(y, fill_value=np.nan, dtype=float)
+    if df.empty or frac <= 0:
+        return df
+
+    d = df[[x_col, y_col]].to_numpy(dtype=float)
+    x = d[:, 0]
+    y = d[:, 1]
+
+    xm, ym = np.nanmedian(x), np.nanmedian(y)
+    xmad, ymad = _mad(x), _mad(y)
+    zx = (x - xm) / (1.4826 * xmad)  # 1.4826 makes MAD comparable to std under normality
+    zy = (y - ym) / (1.4826 * ymad)
+    dist = np.sqrt(zx ** 2 + zy ** 2)
+
+    q = np.nanquantile(dist, 1.0 - frac)
+    keep = dist <= q
+    return df.loc[keep].copy()
+
+
+# ---------- Quadratic fit helper ----------
+
+def _quad_fit_sorted(x_sorted: np.ndarray, y_sorted: np.ndarray) -> Tuple[Tuple[float, float, float], np.ndarray, float]:
+    """
+    Fit y = a x^2 + b x + c on sorted x for a smooth curve.
+    Returns (coeffs a,b,c), yhat_sorted, R^2.
+    """
+    if len(np.unique(x_sorted)) < 3:
+        yhat = np.full_like(y_sorted, np.nan, dtype=float)
         return (np.nan, np.nan, np.nan), yhat, np.nan
 
-    coeffs = np.polyfit(x, y, deg=2)  # a, b, c
-    yhat = np.polyval(coeffs, x)
-    ss_res = np.nansum((y - yhat) ** 2)
-    ss_tot = np.nansum((y - np.nanmean(y)) ** 2)
+    coeffs = np.polyfit(x_sorted, y_sorted, deg=2)  # a, b, c
+    yhat = np.polyval(coeffs, x_sorted)
+    ss_res = np.nansum((y_sorted - yhat) ** 2)
+    ss_tot = np.nansum((y_sorted - np.nanmean(y_sorted)) ** 2)
     r2 = np.nan if ss_tot == 0 else 1 - ss_res / ss_tot
-    return coeffs, yhat, r2
+    return tuple(coeffs), yhat, r2
 
 
-def _scatter_with_quadratic(
+# ---------- Plotting with 2025 highlight + annotations ----------
+
+def _short_date(dt: pd.Timestamp) -> str:
+    # Cross-platform short date like 9/17/25
+    return f"{dt.month}/{dt.day}/{str(dt.year)[-2:]}"
+
+def _scatter_with_quadratic_and_options(
     df: pd.DataFrame,
     x_col: str,
     y_col: str,
@@ -49,35 +97,65 @@ def _scatter_with_quadratic(
     xlabel: str,
     ylabel: str,
     out_png: str,
+    today: date | None = None,
 ) -> None:
     """
-    Make a scatter with a quadratic fit line and R^2 annotation.
+    Build scatter with:
+      - 20% robust outlier removal (bivariate)
+      - quadratic trend line + R^2
+      - 2025 points colored yellow
+      - last 5 most-recent remaining points annotated with short dates
     """
     if df.empty:
         raise RuntimeError("No data to plot after filtering.")
 
-    # Drop NA rows for the two columns
-    d = df[[x_col, y_col]].dropna().copy()
-    if d.empty:
-        raise RuntimeError("No overlapping non-null data points for plotting.")
+    # Trim 20% outliers (bivariate)
+    trimmed = trim_outliers_bivariate(df.dropna(subset=[x_col, y_col]), x_col, y_col, frac=0.20)
+    if trimmed.empty:
+        raise RuntimeError("All points were removed by outlier trimming; cannot plot.")
 
-    x = d[x_col].to_numpy(dtype=float)
-    y = d[y_col].to_numpy(dtype=float)
+    # Split 2025 vs others (after trimming)
+    trimmed = trimmed.copy()
+    trimmed["year"] = trimmed["period"].dt.year
+    p2025 = trimmed["year"] == 2025
+    others = ~p2025
 
-    # Sort by x for a smooth fit curve
+    # Prepare arrays for fit
+    x = trimmed[x_col].to_numpy(dtype=float)
+    y = trimmed[y_col].to_numpy(dtype=float)
+
     order = np.argsort(x)
     x_sorted = x[order]
     y_sorted = y[order]
+    coeffs, yhat_sorted, r2 = _quad_fit_sorted(x_sorted, y_sorted)
 
-    coeffs, yhat_sorted, r2 = _quad_fit(x_sorted, y_sorted)
+    # Plot
+    fig, ax = plt.subplots(figsize=(9.5, 6.5))
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(x, y, alpha=0.7, edgecolors="none", label="Weekly points")
+    # Others first
+    ax.scatter(
+        trimmed.loc[others, x_col],
+        trimmed.loc[others, y_col],
+        alpha=0.75,
+        edgecolors="none",
+        label="Weeks (pre-2025)",
+    )
+    # 2025 in yellow on top
+    if p2025.any():
+        ax.scatter(
+            trimmed.loc[p2025, x_col],
+            trimmed.loc[p2025, y_col],
+            alpha=0.95,
+            edgecolors="black",
+            linewidths=0.4,
+            label="Weeks (2025)",
+            color="yellow",
+            zorder=5,
+        )
 
-    # Draw fitted curve if valid
+    # Fit curve
     if not np.isnan(yhat_sorted).all():
-        ax.plot(x_sorted, yhat_sorted, linewidth=2, label="Quadratic fit")
-
+        ax.plot(x_sorted, yhat_sorted, linewidth=2.2, label="Quadratic fit", zorder=4)
         a, b, c = coeffs
         eq = f"y = {a:.4g}x² + {b:.4g}x + {c:.4g}"
         r2txt = "R² = " + (f"{r2:.3f}" if not np.isnan(r2) else "n/a")
@@ -87,7 +165,19 @@ def _scatter_with_quadratic(
             transform=ax.transAxes,
             ha="left", va="top",
             fontsize=10,
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none"),
+        )
+
+    # Annotate last 5 most recent (by period) AFTER trimming
+    last5 = trimmed.sort_values("period").tail(5)
+    for _, row in last5.iterrows():
+        ax.annotate(
+            _short_date(row["period"]),
+            (row[x_col], row[y_col]),
+            textcoords="offset points",
+            xytext=(6, 6),
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"),
         )
 
     ax.set_title(title)
@@ -100,25 +190,27 @@ def _scatter_with_quadratic(
     plt.close(fig)
 
 
-def make_scatter_salt_vs_price(df: pd.DataFrame, out_png: str) -> None:
-    _scatter_with_quadratic(
+def make_scatter_salt_vs_price(df: pd.DataFrame, out_png: str, *, today: date | None = None) -> None:
+    _scatter_with_quadratic_and_options(
         df=df,
         x_col="salt_bcf",
         y_col="henryhub",
-        title="South Central Salt vs Henry Hub (Apr–Oct, last 5 completed years)",
+        title="South Central Salt vs Henry Hub (Apr–Oct, last 10 years incl. 2025; 20% outliers trimmed)",
         xlabel="South Central Salt Storage (Bcf)",
         ylabel="Henry Hub ($/MMBtu)",
         out_png=out_png,
+        today=today,
     )
 
 
-def make_scatter_us_total_vs_price(df: pd.DataFrame, out_png: str) -> None:
-    _scatter_with_quadratic(
+def make_scatter_us_total_vs_price(df: pd.DataFrame, out_png: str, *, today: date | None = None) -> None:
+    _scatter_with_quadratic_and_options(
         df=df,
         x_col="us_bcf",
         y_col="henryhub",
-        title="U.S. Total Storage vs Henry Hub (Apr–Oct, last 5 completed years)",
+        title="U.S. Total Storage vs Henry Hub (Apr–Oct, last 10 years incl. 2025; 20% outliers trimmed)",
         xlabel="U.S. Total Working Gas (Bcf)",
         ylabel="Henry Hub ($/MMBtu)",
         out_png=out_png,
+        today=today,
     )
