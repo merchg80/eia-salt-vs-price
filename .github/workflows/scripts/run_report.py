@@ -7,10 +7,14 @@ import argparse
 from datetime import date
 
 from eia_storage_plot.fetch import build_weekly_join
-from eia_storage_plot.plot import select_apr_oct_last5, make_scatter
+from eia_storage_plot.plot import (
+    select_apr_oct_last5,
+    make_scatter_salt_vs_price,
+    make_scatter_us_total_vs_price,
+)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Build Apr–Oct last-5-year EIA salt vs Henry Hub scatterplot.")
+    p = argparse.ArgumentParser(description="Build Apr–Oct last-5-year EIA storage vs Henry Hub scatterplots.")
     p.add_argument("--season-last5", action="store_true", help="Use last 5 completed Apr–Oct seasons (default).")
     p.add_argument("--start", help="Override start YYYY-MM-DD (ignored when --season-last5).")
     p.add_argument("--end", help="Override end YYYY-MM-DD (ignored when --season-last5).")
@@ -37,12 +41,17 @@ def main():
     os.makedirs("out/plots", exist_ok=True)
     df.to_csv("out/data/merged.csv", index=False)
 
-    out_png = "out/plots/salt_vs_henryhub.png"
-    make_scatter(df, out_png)
+    # Plots
+    salt_png = "out/plots/salt_vs_henryhub.png"
+    us_png   = "out/plots/us_total_vs_henryhub.png"
+
+    make_scatter_salt_vs_price(df, salt_png)
+    make_scatter_us_total_vs_price(df, us_png)
 
     os.makedirs("docs/plots", exist_ok=True)
     import shutil
-    shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
+    shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
+    shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
 
     print("Rows plotted:", len(df))
 
