@@ -14,7 +14,7 @@ from eia_storage_plot.plot import (
 
 def main():
     today = date.today()
-    # Last 5 years window INCLUDING current year
+    # Last 5 years window INCLUDING current year (e.g., includes 2025)
     start_year = today.year - 4
     end_year = today.year
     start, end = f"{start_year}-04-01", f"{end_year}-10-31"
