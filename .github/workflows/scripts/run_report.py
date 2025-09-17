@@ -1,7 +1,13 @@
 from __future__ import annotations
-import argparse, os
+
+# --- make sure src/ is on the path when running in Actions or locally ---
+import os, sys
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+
+import argparse
 from datetime import date
-import pandas as pd
+import pandas as pd  # noqa: F401 (handy if you add debugging/printing)
+
 from eia_storage_plot.fetch import build_weekly_join
 from eia_storage_plot.plot import filter_windows, make_scatter
 
@@ -29,6 +35,7 @@ def main():
     out_png = "out/plots/salt_vs_henryhub.png"
     make_scatter(plot_df, out_png)
     os.makedirs("docs/plots", exist_ok=True)
+
     import shutil
     shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
 
