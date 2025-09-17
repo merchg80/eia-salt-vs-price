@@ -1,12 +1,9 @@
 name: Build EIA Salt vs Price (Apr–Oct last 10y incl 2025)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: '30 17 * * 4'  # Thursdays 17:30 UTC
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -34,63 +31,33 @@ jobs:
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
-          # Locate src/eia_storage_plot and set PYTHONPATH
+          # Ensure PYTHONPATH includes src
           if [ -d src/eia_storage_plot ]; then
-            SRCDIR="src"
+            export PYTHONPATH="$PYTHONPATH:$PWD/src"
           else
-            SRCDIR=$(dirname "$(dirname "$(find . -path "./.github" -prune -o -type d -name "eia_storage_plot" -print | head -n1)")")
+            LOC=$(find . -type d -name eia_storage_plot | head -n1)
+            [ -z "$LOC" ] && { echo "ERROR: src/eia_storage_plot not found"; exit 1; }
+            export PYTHONPATH="$PYTHONPATH:$(dirname "$(dirname "$LOC")")"
           fi
-          if [ -z "$SRCDIR" ] || [ ! -d "$SRCDIR/eia_storage_plot" ]; then
-            echo "ERROR: Could not find src/eia_storage_plot in repo."
-            find . -maxdepth 3 -type d -name "eia_storage_plot" -print
-            exit 1
-          fi
-          PY_ADD=$(python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SRCDIR")
-          export PYTHONPATH="$PYTHONPATH:$PY_ADD"
 
-          # Write a tiny runner script to disk (avoids YAML heredoc pitfalls)
-          cat > _runner.py <<'PY'
-from __future__ import annotations
-import os, shutil
-from datetime import date
+          python -c "import os,shutil; from datetime import date; \
+from eia_storage_plot.fetch import build_weekly_join; \
+from eia_storage_plot.plot import select_apr_oct_last10_including_current, make_scatter_salt_vs_price, make_scatter_us_total_vs_price; \
+today=date.today(); start_year=today.year-9; end_year=today.year; \
+start=f'{start_year}-04-01'; end=f'{end_year}-10-31'; \
+print(f'[runner] Using Apr–Oct last 10 years incl. current: {start} → {end}'); \
+df=build_weekly_join(start,end); \
+df=select_apr_oct_last10_including_current(df,today=today); \
+os.makedirs('out/data',exist_ok=True); os.makedirs('out/plots',exist_ok=True); \
+df.to_csv('out/data/merged.csv',index=False); \
+salt='out/plots/salt_vs_henryhub.png'; us='out/plots/us_total_vs_henryhub.png'; \
+make_scatter_salt_vs_price(df,salt,today=today); make_scatter_us_total_vs_price(df,us,today=today); \
+os.makedirs('docs/plots',exist_ok=True); \
+shutil.copyfile(salt,'docs/plots/salt_vs_henryhub.png'); \
+shutil.copyfile(us,'docs/plots/us_total_vs_henryhub.png'); \
+print('[runner] rows plotted:',len(df))"
 
-from eia_storage_plot.fetch import build_weekly_join
-from eia_storage_plot.plot import (
-    select_apr_oct_last10_including_current,
-    make_scatter_salt_vs_price,
-    make_scatter_us_total_vs_price,
-)
-
-today = date.today()
-start_year = today.year - 9
-end_year = today.year
-start, end = f"{start_year}-04-01", f"{end_year}-10-31"
-print(f"[runner] Using Apr–Oct last 10 years incl. current: {start} → {end}")
-
-df = build_weekly_join(start, end)
-df = select_apr_oct_last10_including_current(df, today=today)
-
-os.makedirs("out/data", exist_ok=True)
-os.makedirs("out/plots", exist_ok=True)
-df.to_csv("out/data/merged.csv", index=False)
-
-salt_png = "out/plots/salt_vs_henryhub.png"
-us_png   = "out/plots/us_total_vs_henryhub.png"
-
-make_scatter_salt_vs_price(df, salt_png, today=today)
-make_scatter_us_total_vs_price(df, us_png, today=today)
-
-os.makedirs("docs/plots", exist_ok=True)
-shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
-shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
-
-print("[runner] rows plotted:", len(df))
-PY
-
-          python _runner.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: eia-salt-vs-price-outputs
           path: |
@@ -99,9 +66,12 @@ PY
             docs/plots/us_total_vs_henryhub.png
 
       - name: Commit outputs to repo
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add out/data/merged.csv docs/plots/salt_vs_henryhub.png docs/plots/us_total_vs_henryhub.png || true
           git commit -m "CI: update Apr–Oct last-10y plots (salt + US total; 20% trim; 2025 yellow; last5 annotated) [skip ci]" || true
           git push || true
