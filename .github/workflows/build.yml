@@ -3,7 +3,6 @@ name: Build EIA Salt vs Price
 on:
   workflow_dispatch:
     inputs:
-      # Ignored when season_last5=true, kept for manual overrides
       start_date:
         description: 'Optional override start (YYYY-MM-DD)'
         required: false
@@ -17,8 +16,7 @@ on:
         required: false
         default: 'true'
   schedule:
-    # Every Thursday at 17:30 UTC (≈ 12:30 p.m. Central during DST)
-    - cron: '30 17 * * 4'
+    - cron: '30 17 * * 4'  # Thursdays 17:30 UTC
 
 permissions:
   contents: write
@@ -47,7 +45,7 @@ jobs:
           fi
           echo "EIA_API_KEY is present."
 
-      - name: Locate src (prefer repo-root; exclude .github)
+      - name: Locate src (prefer repo root; exclude .github)
         id: locate
         run: |
           if [ -d src ] && [ -d src/eia_storage_plot ]; then
@@ -75,21 +73,22 @@ jobs:
           import os, shutil
           from datetime import date
           from eia_storage_plot.fetch import build_weekly_join
-          from eia_storage_plot.plot import select_apr_oct_last5, make_scatter
+          from eia_storage_plot.plot import (
+              select_apr_oct_last5,
+              make_scatter_salt_vs_price,
+              make_scatter_us_total_vs_price,
+          )
 
-          # Inputs
           start_override = os.getenv("START") or ""
           end_override   = os.getenv("END") or ""
           use_last5      = (os.getenv("SEAS5") or "true").lower() == "true"
 
           today = date.today()
           if use_last5:
-            # Use last 5 COMPLETED Apr–Oct seasons (exclude current year)
             end_year = today.year - 1
             start_year = end_year - 4
             start, end = f"{start_year}-04-01", f"{end_year}-10-31"
           else:
-            # Manual override (or fallback to last 365d)
             if start_override and end_override:
               start, end = start_override, end_override
             else:
@@ -106,11 +105,14 @@ jobs:
           os.makedirs("out/plots", exist_ok=True)
           df.to_csv("out/data/merged.csv", index=False)
 
-          out_png = "out/plots/salt_vs_henryhub.png"
-          make_scatter(df, out_png)
+          salt_png = "out/plots/salt_vs_henryhub.png"
+          us_png   = "out/plots/us_total_vs_henryhub.png"
+          make_scatter_salt_vs_price(df, salt_png)
+          make_scatter_us_total_vs_price(df, us_png)
 
           os.makedirs("docs/plots", exist_ok=True)
-          shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
+          shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
+          shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
 
           print("[runner] rows plotted:", len(df))
           PYCODE
@@ -122,11 +124,12 @@ jobs:
           path: |
             out/**
             docs/plots/salt_vs_henryhub.png
+            docs/plots/us_total_vs_henryhub.png
 
       - name: Commit outputs to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add out/data/merged.csv docs/plots/salt_vs_henryhub.png || true
-          git commit -m "CI: update Apr–Oct last-5 seasons plot [skip ci]" || echo "No changes to commit"
+          git add out/data/merged.csv docs/plots/salt_vs_henryhub.png docs/plots/us_total_vs_henryhub.png || true
+          git commit -m "CI: update Apr–Oct last-5 seasons plots (salt + US total) [skip ci]" || echo "No changes to commit"
           git push || true
