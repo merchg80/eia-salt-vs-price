@@ -7,21 +7,21 @@ from datetime import date
 
 from eia_storage_plot.fetch import build_weekly_join
 from eia_storage_plot.plot import (
-    select_apr_oct_last10_including_current,
+    select_apr_oct_last5_including_current,
     make_scatter_salt_vs_price,
     make_scatter_us_total_vs_price,
 )
 
 def main():
     today = date.today()
-    # Last 10 years window INCLUDING current year
-    start_year = today.year - 9
+    # Last 5 years window INCLUDING current year
+    start_year = today.year - 4
     end_year = today.year
     start, end = f"{start_year}-04-01", f"{end_year}-10-31"
-    print(f"[runner] Using Apr–Oct last 10 years incl. current: {start} → {end}")
+    print(f"[runner] Using Apr–Oct last 5 years incl. current: {start} → {end}")
 
     df = build_weekly_join(start, end)
-    df = select_apr_oct_last10_including_current(df, today=today)
+    df = select_apr_oct_last5_including_current(df, today=today)
 
     os.makedirs("out/data", exist_ok=True)
     os.makedirs("out/plots", exist_ok=True)
@@ -31,8 +31,8 @@ def main():
     salt_png = "out/plots/salt_vs_henryhub.png"
     us_png   = "out/plots/us_total_vs_henryhub.png"
 
-    make_scatter_salt_vs_price(df, salt_png, today=today)
-    make_scatter_us_total_vs_price(df, us_png, today=today)
+    make_scatter_salt_vs_price(df, salt_png)
+    make_scatter_us_total_vs_price(df, us_png)
 
     os.makedirs("docs/plots", exist_ok=True)
     import shutil
