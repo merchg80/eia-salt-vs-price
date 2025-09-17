@@ -11,16 +11,16 @@ EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 SERIES_URL_V1 = "https://api.eia.gov/series/?api_key={key}&series_id={sid}"
 
 # v1 Series IDs
-SID_SALT_WEEKLY   = "NG.W_EPG0_SSO_NUS_DW"   # (sometimes 404s / temporarily unavailable)
-SID_US_TOTAL_WEEK = "NG.W_EPG0_SWO_NUS_DW"
-SID_HENRY_DAILY   = "NG.RNGWHHD.D"
+SID_SALT_WEEKLY   = "NG.W_EPG0_SSO_NUS_DW"   # South Central Salt, weekly, Bcf (may 404 intermittently)
+SID_US_TOTAL_WEEK = "NG.W_EPG0_SWO_NUS_DW"   # U.S./Lower 48 total working gas, weekly, Bcf
+SID_HENRY_DAILY   = "NG.RNGWHHD.D"           # Henry Hub daily spot price, $/MMBtu
 
 # ---- Direct XLS fallbacks (same data, from EIA "View History → Download Data (XLS)") ----
-# Salt (South Central): page https://www.eia.gov/dnav/ng/hist/nw2_epg0_sso_r33_bcfw.htm
+# Salt (South Central): https://www.eia.gov/dnav/ng/hist/nw2_epg0_sso_r33_bcfw.htm
 XLS_SALT_WEEKLY   = "https://www.eia.gov/dnav/ng/hist_xls/NW2_EPG0_SSO_R33_BCFw.xls"
-# Lower 48 Total: page https://www.eia.gov/dnav/ng/hist/nw2_epg0_swo_r48_bcfw.htm
+# Lower 48 Total: https://www.eia.gov/dnav/ng/hist/nw2_epg0_swo_r48_bcfw.htm
 XLS_US_TOTAL_WEEK = "https://www.eia.gov/dnav/ng/hist_xls/NW2_EPG0_SWO_R48_BCFw.xls"
-# Henry Hub daily: page https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm
+# Henry Hub daily: https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm
 XLS_HENRY_DAILY   = "https://www.eia.gov/dnav/ng/hist_xls/rngwhhdd.xls"
 
 
@@ -77,22 +77,15 @@ def _df_from_v1_series(resp_json: dict) -> pd.DataFrame:
 
 def _df_from_hist_xls(binary: bytes) -> pd.DataFrame:
     """
-    Many EIA 'hist_xls' files are simple two-column sheets (Date, Value) or have header rows before data.
-    This parser:
-      1) loads the first sheet without trusting headers,
-      2) keeps the first two columns,
-      3) coerces the first to datetime and the second to numeric,
-      4) drops non-date rows, sorts ascending.
+    Parse EIA 'hist_xls' files (Date/Value in first two columns; ignore headers/notes).
+    Uses xlrd engine for .xls support.
     """
     with io.BytesIO(binary) as buf:
-        raw = pd.read_excel(buf, sheet_name=0, header=None)
+        raw = pd.read_excel(buf, sheet_name=0, header=None, engine="xlrd")
     if raw.shape[1] < 2:
-        # sometimes data starts later; try all columns then pick first 2 that parse cleanly
-        raw = pd.read_excel(io.BytesIO(binary), sheet_name=0, header=None)
-    # Take first two columns
+        raw = pd.read_excel(io.BytesIO(binary), sheet_name=0, header=None, engine="xlrd")
     df = raw.iloc[:, :2].copy()
     df.columns = ["period_raw", "value_raw"]
-    # Coerce
     df["period"] = pd.to_datetime(df["period_raw"], errors="coerce")
     df["value"] = pd.to_numeric(df["value_raw"], errors="coerce")
     df = df.dropna(subset=["period"]).dropna(subset=["value"])
@@ -116,14 +109,13 @@ def _fetch_series_v1(series_id: str) -> pd.DataFrame:
 
 def _fetch_hist_xls(url: str) -> pd.DataFrame:
     r = _http_get(url, stream=True)
-    # Some servers require full read after streaming
     content = r.content if not r.raw.closed else r.raw.read()
     if not content:
         content = r.content
     return _df_from_hist_xls(content)
 
 def _try_v1_then_xls(series_id: str, xls_url: str, label: str) -> pd.DataFrame:
-    # Try v1
+    # Try v1 first
     try:
         df = _fetch_series_v1(series_id)
         if not df.empty:
@@ -142,25 +134,19 @@ def _try_v1_then_xls(series_id: str, xls_url: str, label: str) -> pd.DataFrame:
 
 
 def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
-    """
-    South Central 'Salt' weekly storage (Bcf).
-    """
+    """South Central 'Salt' weekly storage (Bcf)."""
     df = _try_v1_then_xls(SID_SALT_WEEKLY, XLS_SALT_WEEKLY, "South Central SALT weekly")
     df = _clip(df, start, end).rename(columns={"value": "salt_bcf"})
     return df[["period", "salt_bcf"]]
 
 def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
-    """
-    Lower 48 / U.S. Total weekly storage (Bcf). (The dnav page labels it "Lower 48 States", same time series used in WNGSR totals.)
-    """
+    """U.S./Lower 48 Total weekly storage (Bcf)."""
     df = _try_v1_then_xls(SID_US_TOTAL_WEEK, XLS_US_TOTAL_WEEK, "U.S. TOTAL weekly")
     df = _clip(df, start, end).rename(columns={"value": "us_bcf"})
     return df[["period", "us_bcf"]]
 
 def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
-    """
-    Henry Hub daily spot price ($/MMBtu).
-    """
+    """Henry Hub daily spot price ($/MMBtu)."""
     df = _try_v1_then_xls(SID_HENRY_DAILY, XLS_HENRY_DAILY, "Henry Hub daily")
     df = _clip(df, start, end).rename(columns={"value": "henryhub"})
     return df[["period", "henryhub"]]
