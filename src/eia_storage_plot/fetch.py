@@ -6,36 +6,34 @@ import pandas as pd
 
 EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
-# EIA API v2 endpoints
-STORAGES_URL = "https://api.eia.gov/v2/natural-gas/storages/data/"
-HENRY_HUB_URL = "https://api.eia.gov/v2/natural-gas/pri/dpr/data/"
+# Primary: EIA API v1 series endpoint (more stable when v2 hiccups)
+SERIES_URL_V1 = "https://api.eia.gov/series/?api_key={key}&series_id={sid}"
 
-# EIA “SeriesID bridge” (v2 wrapper around v1 series ids)
-SERIESID_URL = "https://api.eia.gov/v2/seriesid/{sid}/?api_key={key}"
+# Backup (kept only as a last resort; we won't rely on it unless needed)
+STORAGES_URL_V2 = "https://api.eia.gov/v2/natural-gas/storages/data/"
+HENRY_HUB_URL_V2 = "https://api.eia.gov/v2/natural-gas/pri/dpr/data/"
 
-# Known series IDs (v1-style) for robust fallback
-SERIES_SALT = "NG.W_EPG0_SSO_NUS_DW"  # South Central Salt, weekly, Bcf
-SERIES_US_TOT = "NG.W_EPG0_SWO_NUS_DW"  # U.S. Total working gas, weekly, Bcf
-SERIES_HENRYHUB_DAILY = "NG.RNGWHHD.D"  # Henry Hub spot, daily, $/MMBtu
+# Series IDs (v1)
+SID_SALT_WEEKLY   = "NG.W_EPG0_SSO_NUS_DW"   # South Central Salt, weekly, Bcf
+SID_US_TOTAL_WEEK = "NG.W_EPG0_SWO_NUS_DW"   # U.S. Total working gas, weekly, Bcf
+SID_HENRY_DAILY   = "NG.RNGWHHD.D"           # Henry Hub spot, daily, $/MMBtu
 
 
-def _fetch_json(url: str, retries: int = 5, backoff_base: float = 1.5) -> dict:
+def _http_get(url: str, retries: int = 6, backoff_base: float = 1.7) -> requests.Response:
     """
-    GET with retry on transient server issues (>=500) and rate limits (429).
-    Exponential backoff: backoff_base ** attempt seconds.
+    Robust GET with exponential backoff on 5xx/429 and network exceptions.
     """
     last_exc = None
     for attempt in range(retries):
         try:
             r = requests.get(url, timeout=60)
-            # Retry on 5xx and 429
             if r.status_code >= 500 or r.status_code == 429:
                 wait = backoff_base ** attempt
                 print(f"[EIA] HTTP {r.status_code}; retrying in {wait:.1f}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json()
+            return r
         except requests.RequestException as e:
             last_exc = e
             wait = backoff_base ** attempt
@@ -43,155 +41,88 @@ def _fetch_json(url: str, retries: int = 5, backoff_base: float = 1.5) -> dict:
             time.sleep(wait)
     if last_exc:
         raise last_exc
-    raise RuntimeError("Unknown error fetching from EIA API")
+    raise RuntimeError("Unknown HTTP error contacting EIA")
 
 
-def _df_from_v2(resp: dict) -> pd.DataFrame:
-    data = resp.get("response", {}).get("data", [])
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df
-    if "period" in df.columns:
-        df["period"] = pd.to_datetime(df["period"])
-    if "value" in df.columns:
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df
-
-
-def _df_from_seriesid(resp: dict) -> pd.DataFrame:
+def _df_from_v1_series(resp_json: dict) -> pd.DataFrame:
     """
-    Normalize v2 /seriesid/ response into columns: period (datetime), value (float).
+    Parse EIA v1 /series response into DataFrame with columns: period (datetime), value (float).
+    Schema: {"series": [{"data": [["2025-09-12", 2.34], ...]}]}
+    Dates may be weekly (YYYY-MM-DD) or daily (YYYY-MM-DD).
     """
-    series = resp.get("response", {}).get("data", [])
+    series = resp_json.get("series", [])
     if not series:
         return pd.DataFrame(columns=["period", "value"])
-    # /seriesid/ returns an array of observations with "period" and "value"
-    df = pd.DataFrame(series)
-    if "period" in df.columns:
-        df["period"] = pd.to_datetime(df["period"])
-    if "value" in df.columns:
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    # Ensure ascending date order
-    if "period" in df.columns:
-        df = df.sort_values("period").reset_index(drop=True)
+    # Take the first series object
+    data = series[0].get("data", [])
+    if not data:
+        return pd.DataFrame(columns=["period", "value"])
+    df = pd.DataFrame(data, columns=["period", "value"])
+    # EIA returns most-recent first; sort ascending
+    df["period"] = pd.to_datetime(df["period"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.sort_values("period").reset_index(drop=True)
     return df[["period", "value"]]
 
 
-def _attempt_primary_then_fallback(primary_fn, fallback_fn, label: str) -> pd.DataFrame:
-    """
-    Try primary fetch; if empty or raises, try fallback.
-    """
-    try:
-        df = primary_fn()
-        if df is not None and not df.empty:
-            print(f"[OK] {label}: primary endpoint returned {len(df)} rows")
-            return df
-        print(f"[WARN] {label}: primary endpoint returned no data; trying fallback")
-    except Exception as e:
-        print(f"[WARN] {label}: primary endpoint failed: {e}; trying fallback")
-    # Fallback
-    df_fb = fallback_fn()
-    if df_fb is None or df_fb.empty:
-        raise RuntimeError(f"{label}: both primary and fallback endpoints returned no data.")
-    print(f"[OK] {label}: fallback endpoint returned {len(df_fb)} rows")
-    return df_fb
+def _clip(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    s, e = pd.to_datetime(start), pd.to_datetime(end)
+    return df[(df["period"] >= s) & (df["period"] <= e)].copy()
 
 
-# -------------------------
-# SALT weekly (primary v2 storages + facets; fallback seriesid)
-# -------------------------
+def _fetch_series_v1(series_id: str) -> pd.DataFrame:
+    url = SERIES_URL_V1.format(key=EIA_API_KEY, sid=series_id)
+    r = _http_get(url)
+    return _df_from_v1_series(r.json())
+
+
+# ---------- Public fetchers ----------
+
 def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
-    def primary():
-        url = (
-            f"{STORAGES_URL}?api_key={EIA_API_KEY}"
-            "&frequency=weekly&sort[0][column]=period&sort[0][direction]=asc"
-            "&data[0]=value"
-            "&facets[region][]=South%20Central&facets[storageType][]=Salt"
-            f"&start={start}&end={end}"
-        )
-        resp = _fetch_json(url)
-        df = _df_from_v2(resp).rename(columns={"value": "salt_bcf"})
-        return df[["period", "salt_bcf"]]
-
-    def fallback():
-        url = SERIESID_URL.format(sid=SERIES_SALT, key=EIA_API_KEY)
-        resp = _fetch_json(url)
-        df = _df_from_seriesid(resp).rename(columns={"value": "salt_bcf"})
-        # clip to date range
-        df = df[(df["period"] >= pd.to_datetime(start)) & (df["period"] <= pd.to_datetime(end))]
-        return df[["period", "salt_bcf"]]
-
-    return _attempt_primary_then_fallback(primary, fallback, "South Central SALT weekly")
+    """South Central 'Salt' weekly storage (Bcf) via v1 /series."""
+    df = _fetch_series_v1(SID_SALT_WEEKLY).rename(columns={"value": "salt_bcf"})
+    df = _clip(df, start, end)
+    return df[["period", "salt_bcf"]]
 
 
-# -------------------------
-# U.S. Total weekly (primary v2 storages; fallback seriesid)
-# -------------------------
 def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
-    def primary():
-        url = (
-            f"{STORAGES_URL}?api_key={EIA_API_KEY}"
-            "&frequency=weekly&sort[0][column]=period&sort[0][direction]=asc"
-            "&data[0]=value"
-            "&facets[region][]=U.S.&facets[storageType][]=Total"
-            f"&start={start}&end={end}"
-        )
-        resp = _fetch_json(url)
-        df = _df_from_v2(resp).rename(columns={"value": "us_bcf"})
-        return df[["period", "us_bcf"]]
-
-    def fallback():
-        url = SERIESID_URL.format(sid=SERIES_US_TOT, key=EIA_API_KEY)
-        resp = _fetch_json(url)
-        df = _df_from_seriesid(resp).rename(columns={"value": "us_bcf"})
-        df = df[(df["period"] >= pd.to_datetime(start)) & (df["period"] <= pd.to_datetime(end))]
-        return df[["period", "us_bcf"]]
-
-    return _attempt_primary_then_fallback(primary, fallback, "U.S. TOTAL weekly")
+    """U.S. Total working gas weekly (Bcf) via v1 /series."""
+    df = _fetch_series_v1(SID_US_TOTAL_WEEK).rename(columns={"value": "us_bcf"})
+    df = _clip(df, start, end)
+    return df[["period", "us_bcf"]]
 
 
-# -------------------------
-# Henry Hub daily (primary v2 daily price; fallback seriesid)
-# -------------------------
 def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
-    def primary():
-        url = (
-            f"{HENRY_HUB_URL}?api_key={EIA_API_KEY}"
-            "&frequency=daily&sort[0][column]=period&sort[0][direction]=asc"
-            "&data[0]=value"
-            "&facets[series][]=Henry%20Hub%20Natural%20Gas%20Spot%20Price"
-            f"&start={start}&end={end}"
-        )
-        resp = _fetch_json(url)
-        df = _df_from_v2(resp).rename(columns={"value": "henryhub"})
-        return df[["period", "henryhub"]]
-
-    def fallback():
-        url = SERIESID_URL.format(sid=SERIES_HENRYHUB_DAILY, key=EIA_API_KEY)
-        resp = _fetch_json(url)
-        df = _df_from_seriesid(resp).rename(columns={"value": "henryhub"})
-        df = df[(df["period"] >= pd.to_datetime(start)) & (df["period"] <= pd.to_datetime(end))]
-        return df[["period", "henryhub"]]
-
-    return _attempt_primary_then_fallback(primary, fallback, "Henry Hub daily")
+    """Henry Hub daily spot price ($/MMBtu) via v1 /series."""
+    df = _fetch_series_v1(SID_HENRY_DAILY).rename(columns={"value": "henryhub"})
+    df = _clip(df, start, end)
+    return df[["period", "henryhub"]]
 
 
 def build_weekly_join(start: str, end: str) -> pd.DataFrame:
+    """
+    Merge weekly SALT + U.S. Total with Henry Hub daily (resampled to W-FRI).
+    """
+    if not EIA_API_KEY:
+        raise RuntimeError("EIA_API_KEY is not set.")
+
     salt = fetch_salt_weekly(start, end)
-    us = fetch_us_total_weekly(start, end)
-    hh = fetch_henry_hub_daily(start, end)
+    us   = fetch_us_total_weekly(start, end)
+    hh   = fetch_henry_hub_daily(start, end)
 
     if salt.empty or us.empty or hh.empty:
         raise RuntimeError(
-            "One or more EIA endpoints returned no data after retries/fallbacks. "
-            "Check EIA_API_KEY, date range, and try again shortly."
+            "One or more datasets are empty after fetching from EIA v1 /series. "
+            "Verify EIA_API_KEY and date range; try again if EIA is experiencing delays."
         )
 
-    # Weekly avg price aligned to Friday (EIA storage week ending)
+    # Weekly avg Henry Hub aligned to Friday week-ending (to match storage 'period')
     hh_w = (
         hh.set_index("period")
           .resample("W-FRI")
           .mean()
           .reset_index()
     )
-    return salt.merge(us, on="period", how="inner").merge(hh_w, on="period", how="inner")
+
+    df = salt.merge(us, on="period", how="inner").merge(hh_w, on="period", how="inner")
+    return df
