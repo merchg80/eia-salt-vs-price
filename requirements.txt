@@ -2,3 +2,4 @@ pandas>=2.1
 matplotlib>=3.8
 requests>=2.31
 python-dateutil>=2.9
+xlrd>=2.0.1
