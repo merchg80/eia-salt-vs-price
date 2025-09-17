@@ -62,59 +62,65 @@ jobs:
           fi
           echo "EIA_API_KEY is present."
 
-      - name: Locate script and src (prefer repo root; exclude .github)
+      - name: Locate src (prefer repo-root; exclude .github)
         id: locate
         run: |
-          # Prefer repo-root scripts/run_report.py, otherwise find the first outside .github
-          if [ -f scripts/run_report.py ]; then
-            SCRIPT="scripts/run_report.py"
-          else
-            SCRIPT=$(find . -path "./.github" -prune -o -path "./.github/*" -prune -o -path "*/scripts/run_report.py" -print | head -n1 || true)
-          fi
-
-          if [ -z "$SCRIPT" ]; then
-            echo "ERROR: run_report.py not found (expected at scripts/run_report.py)"; exit 1
-          fi
-
-          echo "Found script: $SCRIPT"
-          echo "script_path=$SCRIPT" >> $GITHUB_OUTPUT
-
-          # Determine src directory for PYTHONPATH (prefer repo-root src/)
-          if [ -d src ]; then
+          # Prefer a repo-root src containing eia_storage_plot
+          if [ -d src ] && [ -d src/eia_storage_plot ]; then
             SRCDIR="src"
           else
-            CANDIDATE="$(dirname "$SCRIPT")/../src"
-            if [ -d "$CANDIDATE" ]; then
-              SRCDIR="$CANDIDATE"
-            else
-              SRCDIR=""
-            fi
+            # Find first src that contains eia_storage_plot outside .github
+            SRCDIR=$(find . -path "./.github" -prune -o -type d -name "eia_storage_plot" -print | head -n1 | xargs -r dirname | xargs -r dirname)
           fi
+
+          if [ -z "$SRCDIR" ] || [ ! -d "$SRCDIR/eia_storage_plot" ]; then
+            echo "ERROR: Could not find src/eia_storage_plot in repo."; exit 1
+          fi
+
           echo "Using SRCDIR: $SRCDIR"
           echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
 
-      - name: Run report
+      - name: Run report (inline runner; no scripts/run_report.py needed)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          START: ${{ github.event.inputs.start_date }}
+          END: ${{ github.event.inputs.end_date }}
+          ALL_DATA: ${{ github.event.inputs.all_data }}
         run: |
-          SCRIPT="${{ steps.locate.outputs.script_path }}"
           SRCDIR="${{ steps.locate.outputs.src_path }}"
-
           # Build PYTHONPATH so eia_storage_plot can be imported
-          if [ -n "$SRCDIR" ]; then
-            export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
-          fi
+          export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
 
-          START="${{ github.event.inputs.start_date }}"
-          END="${{ github.event.inputs.end_date }}"
-          ALL="${{ github.event.inputs.all_data }}"
-          if [ -z "$START" ]; then START="2024-08-01"; fi
+          python - <<'PYCODE'
+          from __future__ import annotations
+          import os, shutil
+          from datetime import date
+          from eia_storage_plot.fetch import build_weekly_join
+          from eia_storage_plot.plot import filter_windows, make_scatter
 
-          if [ "$ALL" = "true" ]; then
-            python "$SCRIPT" --start "$START" ${END:+--end "$END"} --all-data
-          else
-            python "$SCRIPT" --start "$START" ${END:+--end "$END"}
-          fi
+          START = os.getenv("START") or "2024-08-01"
+          END = os.getenv("END") or date.today().strftime("%Y-%m-%d")
+          ALL = (os.getenv("ALL_DATA") or "false").lower() == "true"
+
+          print(f"[runner] start={START} end={END} all_data={ALL}")
+
+          df = build_weekly_join(START, END)
+
+          os.makedirs("out/data", exist_ok=True)
+          os.makedirs("out/plots", exist_ok=True)
+          df.to_csv("out/data/merged.csv", index=False)
+
+          plot_df = df if ALL else filter_windows(df)
+
+          out_png = "out/plots/salt_vs_henryhub.png"
+          make_scatter(plot_df, out_png)
+
+          os.makedirs("docs/plots", exist_ok=True)
+          shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
+
+          print("[runner] rows merged:", len(df))
+          print("[runner] rows plotted:", len(plot_df))
+          PYCODE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
