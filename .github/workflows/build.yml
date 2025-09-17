@@ -1,20 +1,7 @@
-name: Build EIA Salt vs Price
+name: Build EIA Salt vs Price (Apr–Oct last 10y incl 2025)
 
 on:
-  workflow_dispatch:
-    inputs:
-      start_date:
-        description: 'Optional override start (YYYY-MM-DD)'
-        required: false
-        default: ''
-      end_date:
-        description: 'Optional override end (YYYY-MM-DD)'
-        required: false
-        default: ''
-      season_last5:
-        description: 'Use last 5 completed Apr–Oct seasons (true/false)'
-        required: false
-        default: 'true'
+  workflow_dispatch: {}
   schedule:
     - cron: '30 17 * * 4'  # Thursdays 17:30 UTC
 
@@ -45,7 +32,7 @@ jobs:
           fi
           echo "EIA_API_KEY is present."
 
-      - name: Locate src (prefer repo root; exclude .github)
+      - name: Locate src
         id: locate
         run: |
           if [ -d src ] && [ -d src/eia_storage_plot ]; then
@@ -58,64 +45,13 @@ jobs:
           fi
           echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
 
-      - name: Run report (Apr–Oct last 5 completed years)
+      - name: Run report (Apr–Oct last 10 years incl. 2025)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-          START: ${{ github.event.inputs.start_date }}
-          END: ${{ github.event.inputs.end_date }}
-          SEAS5: ${{ github.event.inputs.season_last5 }}
         run: |
           SRCDIR="${{ steps.locate.outputs.src_path }}"
           export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
-
-          python - <<'PYCODE'
-          from __future__ import annotations
-          import os, shutil
-          from datetime import date
-          from eia_storage_plot.fetch import build_weekly_join
-          from eia_storage_plot.plot import (
-              select_apr_oct_last5,
-              make_scatter_salt_vs_price,
-              make_scatter_us_total_vs_price,
-          )
-
-          start_override = os.getenv("START") or ""
-          end_override   = os.getenv("END") or ""
-          use_last5      = (os.getenv("SEAS5") or "true").lower() == "true"
-
-          today = date.today()
-          if use_last5:
-            end_year = today.year - 1
-            start_year = end_year - 4
-            start, end = f"{start_year}-04-01", f"{end_year}-10-31"
-          else:
-            if start_override and end_override:
-              start, end = start_override, end_override
-            else:
-              end = today.strftime("%Y-%m-%d")
-              start = (today.replace(year=today.year - 1)).strftime("%Y-%m-%d")
-
-          print(f"[runner] start={start} end={end} use_last5={use_last5}")
-
-          df = build_weekly_join(start, end)
-          if use_last5:
-            df = select_apr_oct_last5(df, today=today)
-
-          os.makedirs("out/data", exist_ok=True)
-          os.makedirs("out/plots", exist_ok=True)
-          df.to_csv("out/data/merged.csv", index=False)
-
-          salt_png = "out/plots/salt_vs_henryhub.png"
-          us_png   = "out/plots/us_total_vs_henryhub.png"
-          make_scatter_salt_vs_price(df, salt_png)
-          make_scatter_us_total_vs_price(df, us_png)
-
-          os.makedirs("docs/plots", exist_ok=True)
-          shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
-          shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
-
-          print("[runner] rows plotted:", len(df))
-          PYCODE
+          python scripts/run_report.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -131,5 +67,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add out/data/merged.csv docs/plots/salt_vs_henryhub.png docs/plots/us_total_vs_henryhub.png || true
-          git commit -m "CI: update Apr–Oct last-5 seasons plots (salt + US total) [skip ci]" || echo "No changes to commit"
+          git commit -m "CI: update Apr–Oct last-10y plots (salt + US total; 20% trim; 2025 yellow; last5 annotated) [skip ci]" || echo "No changes to commit"
           git push || true
