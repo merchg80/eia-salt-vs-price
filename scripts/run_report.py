@@ -7,19 +7,19 @@ from datetime import date
 
 from eia_storage_plot.fetch import build_weekly_join
 from eia_storage_plot.plot import (
-    select_apr_oct_since_2017_including_current,
+    select_jun_nov_since_2015_including_current,
     make_scatter_salt_vs_price,
     make_scatter_us_total_vs_price,
 )
 
 def main():
     today = date.today()
-    # Apr–Oct from 2017 through current year (e.g., includes 2025)
-    start, end = "2017-04-01", f"{today.year}-10-31"
-    print(f"[runner] Using Apr–Oct 2017–{today.year}: {start} → {end}")
+    # Jun–Nov from 2015 through current year (includes 2025)
+    start, end = "2015-06-01", f"{today.year}-11-30"
+    print(f"[runner] Using Jun–Nov 2015–{today.year}: {start} → {end}")
 
     df = build_weekly_join(start, end)
-    df = select_apr_oct_since_2017_including_current(df, today=today)
+    df = select_jun_nov_since_2015_including_current(df, today=today)
 
     os.makedirs("out/data", exist_ok=True)
     os.makedirs("out/plots", exist_ok=True)
