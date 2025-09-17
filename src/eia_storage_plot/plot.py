@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 def filter_windows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep Aug–Oct 2024 and Aug–Sep 2025 (to date)."""
     d = df.copy()
     d["year"] = d["period"].dt.year
     d["month"] = d["period"].dt.month
@@ -14,6 +15,7 @@ def make_scatter(df: pd.DataFrame, out_png: str, title: str | None = None) -> No
     if df.empty:
         raise ValueError("No data to plot")
     plt.figure(figsize=(9,7))
+    # X: weekly avg Henry Hub, Y: Salt; color = U.S. total (no explicit colors set)
     sc = plt.scatter(df["henryhub"], df["salt_bcf"], c=df["us_bcf"], alpha=0.85)
     plt.colorbar(sc, label="Total U.S. Working Gas (Bcf)")
     plt.xlabel("Henry Hub price (weekly avg, $/MMBtu)")
