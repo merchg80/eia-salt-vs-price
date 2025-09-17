@@ -1,7 +1,7 @@
 name: Build EIA Salt vs Price (Apr–Oct last 10y incl 2025)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
     - cron: '30 17 * * 4'  # Thursdays 17:30 UTC
 
@@ -12,11 +12,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -32,7 +30,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build plots (inline Python)
+      - name: Build plots
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
@@ -47,10 +45,11 @@ jobs:
             find . -maxdepth 3 -type d -name "eia_storage_plot" -print
             exit 1
           fi
-          ADDPATH=$(python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SRCDIR")
-          export PYTHONPATH="$PYTHONPATH:$ADDPATH"
+          PY_ADD=$(python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SRCDIR")
+          export PYTHONPATH="$PYTHONPATH:$PY_ADD"
 
-          python - <<'PYCODE'
+          # Write a tiny runner script to disk (avoids YAML heredoc pitfalls)
+          cat > _runner.py <<'PY'
 from __future__ import annotations
 import os, shutil
 from datetime import date
@@ -86,7 +85,9 @@ shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
 shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
 
 print("[runner] rows plotted:", len(df))
-PYCODE
+PY
+
+          python _runner.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -102,5 +103,5 @@ PYCODE
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add out/data/merged.csv docs/plots/salt_vs_henryhub.png docs/plots/us_total_vs_henryhub.png || true
-          git commit -m "CI: update Apr–Oct last-10y plots (salt + US total; 20% trim; 2025 yellow; last5 annotated) [skip ci]" || echo "No changes to commit"
+          git commit -m "CI: update Apr–Oct last-10y plots (salt + US total; 20% trim; 2025 yellow; last5 annotated) [skip ci]" || true
           git push || true
