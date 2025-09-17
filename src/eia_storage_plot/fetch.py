@@ -3,8 +3,16 @@ import os
 import time
 import io
 import itertools
+import warnings
 import requests
 import pandas as pd
+
+# Reduce noisy HTML/XLS date parsing warnings (harmless)
+warnings.filterwarnings(
+    "ignore",
+    message="Could not infer format, so each element will be parsed individually",
+    category=UserWarning,
+)
 
 EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
@@ -207,12 +215,18 @@ def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
 
 
 # =======================================================================================
-# Public join
+# Public join (now tolerant + diagnostic)
 # =======================================================================================
+
+def _daterange_summary(df: pd.DataFrame, col: str) -> str:
+    if df.empty:
+        return "empty"
+    return f"{df[col].min().date()} → {df[col].max().date()} ({len(df)} rows)"
 
 def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     """
     Merge weekly SALT + U.S. Total with Henry Hub daily (resampled to W-FRI).
+    Continues with best-effort merging and prints diagnostics instead of failing fast.
     """
     if not EIA_API_KEY:
         print("[INFO] EIA_API_KEY not set; will use XLS/HTML fallbacks as needed.")
@@ -221,19 +235,36 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     us   = fetch_us_total_weekly(start, end)
     hh   = fetch_henry_hub_daily(start, end)
 
-    if salt.empty or us.empty or hh.empty:
-        raise RuntimeError(
-            "One or more datasets are empty after all fallbacks. "
-            "Please retry; EIA may be temporarily unavailable."
-        )
+    # Diagnostics
+    print(f"[INFO] SALT window: {_daterange_summary(salt, 'period')}")
+    print(f"[INFO] US   window: {_daterange_summary(us, 'period')}")
+    print(f"[INFO] HH   window: {_daterange_summary(hh, 'period')}")
 
+    # If any empty, try to continue and see if inner-join still yields rows
     # Weekly avg Henry Hub aligned to Friday week-ending (to match storage 'period')
-    hh_w = (
-        hh.set_index("period")
-          .resample("W-FRI")
-          .mean()
-          .reset_index()
-    )
+    if not hh.empty:
+        hh_w = (
+            hh.set_index("period")
+              .resample("W-FRI")
+              .mean()
+              .reset_index()
+        )
+    else:
+        hh_w = hh.copy()
 
-    df = salt.merge(us, on="period", how="inner").merge(hh_w, on="period", how="inner")
-    return df
+    merged = salt.merge(us, on="period", how="inner")
+    merged = merged.merge(hh_w, on="period", how="inner")
+
+    if merged.empty:
+        # Provide precise diagnostics before failing
+        msg = [
+            "Merged dataset is empty after alignment.",
+            f"SALT: {_daterange_summary(salt, 'period')}",
+            f"US  : {_daterange_summary(us, 'period')}",
+            f"HH_w: {_daterange_summary(hh_w, 'period')}",
+            f"Requested clip: {start} → {end}",
+            "Tip: try a slightly wider date window or re-run later if EIA pages are mid-update.",
+        ]
+        raise RuntimeError("\n".join(msg))
+
+    return merged
