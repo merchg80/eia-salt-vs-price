@@ -7,7 +7,7 @@ import warnings
 import requests
 import pandas as pd
 
-# Reduce noisy HTML/XLS date parsing warnings (harmless)
+# Reduce noisy date-parsing warnings from HTML/XLS fallbacks
 warnings.filterwarnings(
     "ignore",
     message="Could not infer format, so each element will be parsed individually",
@@ -16,7 +16,10 @@ warnings.filterwarnings(
 
 EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
-# ---- API (primary) ----
+# ---- EIA endpoints ----
+# v2 (preferred for Henry Hub when available)
+HENRY_HUB_URL_V2 = "https://api.eia.gov/v2/natural-gas/pri/dpr/data/"
+# v1 series
 SERIES_URL_V1 = "https://api.eia.gov/series/?api_key={key}&series_id={sid}"
 
 # v1 Series IDs
@@ -85,6 +88,21 @@ def _df_from_v1_series(resp_json: dict) -> pd.DataFrame:
     return df[["period", "value"]]
 
 
+def _df_from_v2_price(resp_json: dict) -> pd.DataFrame:
+    """
+    Parse EIA v2 price endpoint (pri/dpr) into DataFrame with columns: period (datetime), value (float).
+    """
+    data = resp_json.get("response", {}).get("data", [])
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=["period", "value"])
+    df["period"] = pd.to_datetime(df["period"], errors="coerce")
+    # v2 field is 'value'
+    df["value"]  = pd.to_numeric(df.get("value"), errors="coerce")
+    df = df.dropna(subset=["period", "value"]).sort_values("period").reset_index(drop=True)
+    return df[["period", "value"]]
+
+
 def _df_from_hist_xls(binary: bytes) -> pd.DataFrame:
     """
     Parse legacy EIA .xls files:
@@ -94,7 +112,6 @@ def _df_from_hist_xls(binary: bytes) -> pd.DataFrame:
     """
     raw = pd.read_excel(io.BytesIO(binary), sheet_name=0, header=None, engine="xlrd")
 
-    # Try to auto-detect the best (date_col, value_col) pair
     best = None  # (score, df)
     ncols = raw.shape[1]
     for date_idx, val_idx in itertools.product(range(ncols), repeat=2):
@@ -104,11 +121,10 @@ def _df_from_hist_xls(binary: bytes) -> pd.DataFrame:
                           "value":  pd.to_numeric(raw.iloc[:, val_idx], errors="coerce")})
         d = d.dropna(subset=["period", "value"])
         score = len(d)
-        if score >= 10:  # enough points to be plausible
+        if score >= 10:
             d = d.sort_values("period").reset_index(drop=True)
             best = (score, d) if (best is None or score > best[0]) else best
     if best is None:
-        # Fallback: assume first two columns
         d = pd.DataFrame({"period": pd.to_datetime(raw.iloc[:, 0], errors="coerce"),
                           "value":  pd.to_numeric(raw.iloc[:, 1], errors="coerce")})
         d = d.dropna(subset=["period", "value"]).sort_values("period").reset_index(drop=True)
@@ -121,10 +137,9 @@ def _df_from_hist_html(url: str) -> pd.DataFrame:
     Parse EIA history pages by reading HTML tables and selecting the best date/value column pair.
     Requires lxml (installed via requirements).
     """
-    tables = pd.read_html(url)  # returns list[DataFrame]
+    tables = pd.read_html(url)  # list[DataFrame]
     best = None  # (score, df)
     for t in tables:
-        # Normalize headers away; treat everything as raw
         t = t.copy()
         t.columns = [str(c) for c in range(t.shape[1])]
         ncols = t.shape[1]
@@ -151,7 +166,7 @@ def _clip(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
 
 
 # =======================================================================================
-# Fetchers with layered fallbacks: v1 /series → XLS → HTML
+# Fetchers with layered fallbacks
 # =======================================================================================
 
 def _fetch_series_v1(series_id: str) -> pd.DataFrame:
@@ -166,56 +181,84 @@ def _fetch_hist_xls(url: str) -> pd.DataFrame:
         content = r.content
     return _df_from_hist_xls(content)
 
-def _try_v1_then_xls_then_html(series_id: str, xls_url: str, html_url: str, label: str) -> pd.DataFrame:
-    # 1) v1 /series
-    try:
-        df = _fetch_series_v1(series_id)
-        if not df.empty:
-            print(f"[OK] {label}: v1 /series returned {len(df)} rows")
-            return df
-        print(f"[WARN] {label}: v1 /series returned no rows; trying XLS")
-    except Exception as e:
-        print(f"[WARN] {label}: v1 /series failed: {e}; trying XLS")
+def _fetch_price_v2_daily(start: str, end: str) -> pd.DataFrame:
+    """
+    Henry Hub daily via v2 pri/dpr endpoint.
+    """
+    params = (
+        f"?api_key={EIA_API_KEY}"
+        "&frequency=daily"
+        "&sort[0][column]=period&sort[0][direction]=asc"
+        "&data[0]=value"
+        "&facets[series][]=Henry%20Hub%20Natural%20Gas%20Spot%20Price"
+        f"&start={start}&end={end}"
+    )
+    url = HENRY_HUB_URL_V2 + params
+    r = _http_get(url)
+    return _df_from_v2_price(r.json())
 
-    # 2) XLS
-    try:
-        df_x = _fetch_hist_xls(xls_url)
-        if not df_x.empty:
-            print(f"[OK] {label}: XLS fallback returned {len(df_x)} rows")
-            return df_x
-        print(f"[WARN] {label}: XLS fallback returned no rows; trying HTML")
-    except Exception as e:
-        print(f"[WARN] {label}: XLS fallback failed: {e}; trying HTML")
 
-    # 3) HTML
-    df_h = _df_from_hist_html(html_url)
-    if df_h.empty:
-        raise RuntimeError(f"{label}: All sources failed (v1/XLS/HTML).")
-    print(f"[OK] {label}: HTML fallback returned {len(df_h)} rows")
-    return df_h
+def _try_chain(*funcs):
+    """
+    Try a list of callables that return DataFrames; return first non-empty result.
+    Each callable must be zero-arg; use lambdas to bind arguments.
+    """
+    last_err = None
+    for fn in funcs:
+        try:
+            df = fn()
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] fallback step failed: {e}")
+    if last_err:
+        print(f"[WARN] all fallbacks failed; last error: {last_err}")
+    return pd.DataFrame(columns=["period", "value"])
 
 
 def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
-    """South Central 'Salt' weekly storage (Bcf)."""
-    df = _try_v1_then_xls_then_html(SID_SALT_WEEKLY, XLS_SALT_WEEKLY, HTML_SALT_WEEKLY, "South Central SALT weekly")
-    df = _clip(df, start, end).rename(columns={"value": "salt_bcf"})
+    """
+    South Central 'Salt' weekly storage (Bcf).
+    Order: v1 → XLS → HTML
+    """
+    df = _try_chain(
+        lambda: _clip(_fetch_series_v1(SID_SALT_WEEKLY), start, end),
+        lambda: _clip(_fetch_hist_xls(XLS_SALT_WEEKLY), start, end),
+        lambda: _clip(_df_from_hist_html(HTML_SALT_WEEKLY), start, end),
+    ).rename(columns={"value": "salt_bcf"})
     return df[["period", "salt_bcf"]]
 
+
 def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
-    """U.S./Lower 48 Total weekly storage (Bcf)."""
-    df = _try_v1_then_xls_then_html(SID_US_TOTAL_WEEK, XLS_US_TOTAL_WEEK, HTML_US_TOTAL_WEEK, "U.S. TOTAL weekly")
-    df = _clip(df, start, end).rename(columns={"value": "us_bcf"})
+    """
+    U.S./Lower 48 Total weekly storage (Bcf).
+    Order: v1 → XLS → HTML
+    """
+    df = _try_chain(
+        lambda: _clip(_fetch_series_v1(SID_US_TOTAL_WEEK), start, end),
+        lambda: _clip(_fetch_hist_xls(XLS_US_TOTAL_WEEK), start, end),
+        lambda: _clip(_df_from_hist_html(HTML_US_TOTAL_WEEK), start, end),
+    ).rename(columns={"value": "us_bcf"})
     return df[["period", "us_bcf"]]
 
+
 def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
-    """Henry Hub daily spot price ($/MMBtu)."""
-    df = _try_v1_then_xls_then_html(SID_HENRY_DAILY, XLS_HENRY_DAILY, HTML_HENRY_DAILY, "Henry Hub daily")
-    df = _clip(df, start, end).rename(columns={"value": "henryhub"})
+    """
+    Henry Hub daily spot price ($/MMBtu).
+    Order: v2 → v1 → XLS → HTML
+    """
+    df = _try_chain(
+        lambda: _clip(_fetch_price_v2_daily(start, end), start, end),
+        lambda: _clip(_fetch_series_v1(SID_HENRY_DAILY), start, end),
+        lambda: _clip(_fetch_hist_xls(XLS_HENRY_DAILY), start, end),
+        lambda: _clip(_df_from_hist_html(HTML_HENRY_DAILY), start, end),
+    ).rename(columns={"value": "henryhub"})
     return df[["period", "henryhub"]]
 
 
 # =======================================================================================
-# Public join (now tolerant + diagnostic)
+# Public join (diagnostic)
 # =======================================================================================
 
 def _daterange_summary(df: pd.DataFrame, col: str) -> str:
@@ -226,22 +269,19 @@ def _daterange_summary(df: pd.DataFrame, col: str) -> str:
 def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     """
     Merge weekly SALT + U.S. Total with Henry Hub daily (resampled to W-FRI).
-    Continues with best-effort merging and prints diagnostics instead of failing fast.
     """
     if not EIA_API_KEY:
-        print("[INFO] EIA_API_KEY not set; will use XLS/HTML fallbacks as needed.")
+        print("[INFO] EIA_API_KEY not set or v2/v1 may be flaky; using fallbacks as needed.")
 
     salt = fetch_salt_weekly(start, end)
     us   = fetch_us_total_weekly(start, end)
     hh   = fetch_henry_hub_daily(start, end)
 
-    # Diagnostics
     print(f"[INFO] SALT window: {_daterange_summary(salt, 'period')}")
     print(f"[INFO] US   window: {_daterange_summary(us, 'period')}")
     print(f"[INFO] HH   window: {_daterange_summary(hh, 'period')}")
 
-    # If any empty, try to continue and see if inner-join still yields rows
-    # Weekly avg Henry Hub aligned to Friday week-ending (to match storage 'period')
+    # Build HH weekly avg aligned to Friday
     if not hh.empty:
         hh_w = (
             hh.set_index("period")
@@ -250,20 +290,32 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
               .reset_index()
         )
     else:
-        hh_w = hh.copy()
+        # Still empty? Try v2 without end constraint (sometimes newest days not yet indexed)
+        try:
+            hh2 = _fetch_price_v2_daily(start, end)
+            if not hh2.empty:
+                hh2 = _clip(hh2, start, end)
+                hh_w = (
+                    hh2.set_index("period").resample("W-FRI").mean().reset_index()
+                )
+                print(f"[INFO] HH re-pull via v2 succeeded: {_daterange_summary(hh2, 'period')}")
+            else:
+                hh_w = hh.copy()
+        except Exception as e:
+            print(f"[WARN] HH final v2 attempt failed: {e}")
+            hh_w = hh.copy()
 
     merged = salt.merge(us, on="period", how="inner")
     merged = merged.merge(hh_w, on="period", how="inner")
 
     if merged.empty:
-        # Provide precise diagnostics before failing
         msg = [
             "Merged dataset is empty after alignment.",
             f"SALT: {_daterange_summary(salt, 'period')}",
             f"US  : {_daterange_summary(us, 'period')}",
             f"HH_w: {_daterange_summary(hh_w, 'period')}",
             f"Requested clip: {start} → {end}",
-            "Tip: try a slightly wider date window or re-run later if EIA pages are mid-update.",
+            "Tip: try re-running later or extend the window a week earlier/later; HH may lag on some sources.",
         ]
         raise RuntimeError("\n".join(msg))
 
