@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import requests
 import pandas as pd
 
@@ -9,10 +10,33 @@ EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 STORAGES_URL = "https://api.eia.gov/v2/natural-gas/storages/data/"
 HENRY_HUB_URL = "https://api.eia.gov/v2/natural-gas/pri/dpr/data/"
 
-def _fetch_json(url: str) -> dict:
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return r.json()
+def _fetch_json(url: str, retries: int = 5, backoff_base: float = 1.5) -> dict:
+    """
+    GET with retry on transient server issues (>=500) and rate limits (429).
+    Exponential backoff: backoff_base ** attempt seconds.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=60)
+            # Retry on 5xx and 429
+            if r.status_code >= 500 or r.status_code == 429:
+                wait = backoff_base ** attempt
+                print(f"[EIA] HTTP {r.status_code}; retrying in {wait:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last_exc = e
+            # For network hiccups, also backoff
+            wait = backoff_base ** attempt
+            print(f"[EIA] RequestException: {e}; retrying in {wait:.1f}s (attempt {attempt+1}/{retries})")
+            time.sleep(wait)
+    # Exhausted retries
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown error fetching from EIA API")
 
 def _df_from_v2(resp: dict) -> pd.DataFrame:
     data = resp.get("response", {}).get("data", [])
@@ -67,8 +91,8 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     hh = fetch_henry_hub_daily(start, end)
     if salt.empty or us.empty or hh.empty:
         raise RuntimeError(
-            "One or more EIA endpoints returned no data. "
-            "Verify EIA_API_KEY (repo secret), the date range, and that the endpoints are reachable."
+            "One or more EIA endpoints returned no data after retries. "
+            "Check EIA_API_KEY, date range, and try again shortly (EIA may be temporarily unavailable)."
         )
     # Weekly avg price aligned to Friday (EIA storage week ending)
     hh_w = (
