@@ -6,17 +6,17 @@ from datetime import date
 from typing import Tuple
 
 
-# ---------- Window selection: last 5 years incl. current (e.g., includes 2025) ----------
+# ---------- Window selection: Apr–Oct from 2017 through current year (incl. 2025) ----------
 
-def select_apr_oct_last5_including_current(df: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
+def select_apr_oct_since_2017_including_current(df: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
     """
-    Keep a continuous dataset for Apr–Oct for the last 5 years, INCLUDING the current year.
-    Example (today=2025-09-17): keep 2021–2025, months 4..10 inclusive.
+    Keep Apr–Oct data from 2017 through the current year (inclusive).
+    Example (today=2025-09-17): keep 2017–2025, months 4..10 inclusive.
     """
     if today is None:
         today = date.today()
-    end_year = today.year            # include current year
-    start_year = end_year - 4        # last 5 years inclusive
+    start_year = 2017
+    end_year = today.year
 
     d = df.copy()
     d["year"] = d["period"].dt.year
@@ -42,7 +42,7 @@ def trim_outliers_bivariate(
     Remove the top `frac` of points farthest from the robust center in standardized space.
     Steps:
       - Robust center = median(x), median(y)
-      - Scale: MAD for x and y
+      - Scale: MAD for x and y (scaled to ~std with 1.4826)
       - Distance = sqrt(zx^2 + zy^2)
       - Drop the largest `frac` quantile by distance
     """
@@ -83,10 +83,10 @@ def _quad_fit_sorted(x_sorted: np.ndarray, y_sorted: np.ndarray) -> Tuple[Tuple[
     return tuple(coeffs), yhat, r2
 
 
-# ---------- Plotting with 2025 highlight + annotations ----------
+# ---------- Plotting with 2025 highlight + 2025-only annotations ----------
 
 def _short_date(dt: pd.Timestamp) -> str:
-    # Cross-platform short date like 9/17/25
+    # Short date like 9/17/25
     return f"{dt.month}/{dt.day}/{str(dt.year)[-2:]}"
 
 def _scatter_with_quadratic_and_options(
@@ -103,7 +103,7 @@ def _scatter_with_quadratic_and_options(
       - 20% robust outlier removal (bivariate)
       - quadratic trend line + R^2
       - 2025 points colored yellow
-      - annotate the 5 most-recent (by period) NON-2025 points with short dates
+      - annotate the 5 most-recent 2025 points with short dates
     """
     if df.empty:
         raise RuntimeError("No data to plot after filtering.")
@@ -113,7 +113,7 @@ def _scatter_with_quadratic_and_options(
     if trimmed.empty:
         raise RuntimeError("All points were removed by outlier trimming; cannot plot.")
 
-    # Split 2025 vs others (after trimming)
+    # Identify 2025 points (after trimming)
     trimmed = trimmed.copy()
     trimmed["year"] = trimmed["period"].dt.year
     is_2025 = trimmed["year"] == 2025
@@ -131,13 +131,14 @@ def _scatter_with_quadratic_and_options(
     fig, ax = plt.subplots(figsize=(9.5, 6.5))
 
     # Non-2025 points
-    ax.scatter(
-        trimmed.loc[not_2025, x_col],
-        trimmed.loc[not_2025, y_col],
-        alpha=0.75,
-        edgecolors="none",
-        label="Weeks (non-2025)",
-    )
+    if not_2025.any():
+        ax.scatter(
+            trimmed.loc[not_2025, x_col],
+            trimmed.loc[not_2025, y_col],
+            alpha=0.75,
+            edgecolors="none",
+            label="Weeks (2017–2024)",
+        )
     # 2025 in yellow on top
     if is_2025.any():
         ax.scatter(
@@ -166,9 +167,9 @@ def _scatter_with_quadratic_and_options(
             bbox=dict(facecolor="white", alpha=0.85, edgecolor="none"),
         )
 
-    # Annotate the 5 most-recent NON-2025 points AFTER trimming
-    recent_non_2025 = trimmed.loc[not_2025].sort_values("period").tail(5)
-    for _, row in recent_non_2025.iterrows():
+    # Annotate the 5 most-recent 2025 points AFTER trimming
+    recent_2025 = trimmed.loc[is_2025].sort_values("period").tail(5)
+    for _, row in recent_2025.iterrows():
         ax.annotate(
             _short_date(row["period"]),
             (row[x_col], row[y_col]),
@@ -193,7 +194,7 @@ def make_scatter_salt_vs_price(df: pd.DataFrame, out_png: str) -> None:
         df=df,
         x_col="salt_bcf",
         y_col="henryhub",
-        title="South Central Salt vs Henry Hub (Apr–Oct, last 5 years incl. 2025; 20% outliers trimmed)",
+        title="South Central Salt vs Henry Hub (Apr–Oct, 2017–2025; 20% outliers trimmed)",
         xlabel="South Central Salt Storage (Bcf)",
         ylabel="Henry Hub ($/MMBtu)",
         out_png=out_png,
@@ -205,7 +206,7 @@ def make_scatter_us_total_vs_price(df: pd.DataFrame, out_png: str) -> None:
         df=df,
         x_col="us_bcf",
         y_col="henryhub",
-        title="U.S. Total Storage vs Henry Hub (Apr–Oct, last 5 years incl. 2025; 20% outliers trimmed)",
+        title="U.S. Total Storage vs Henry Hub (Apr–Oct, 2017–2025; 20% outliers trimmed)",
         xlabel="U.S. Total Working Gas (Bcf)",
         ylabel="Henry Hub ($/MMBtu)",
         out_png=out_png,
