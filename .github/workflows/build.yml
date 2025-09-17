@@ -35,48 +35,88 @@ jobs:
           ls -la
           echo "---- up to 3 levels ----"
           find . -maxdepth 3 -type d -print
-          echo "---- any run_report.py? ----"
-          find . -maxdepth 5 -type f -name "run_report.py" -print
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install deps (auto-detect requirements.txt)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            REQ=$(find . -maxdepth 4 -type f -name "requirements.txt" | head -n1)
+            if [ -z "$REQ" ]; then
+              echo "ERROR: requirements.txt not found anywhere in repo"; exit 1
+            fi
+            echo "Using $REQ"
+            pip install -r "$REQ"
+          fi
 
       - name: Check EIA_API_KEY presence
         run: |
           if [ -z "${{ secrets.EIA_API_KEY }}" ]; then
-            echo "EIA_API_KEY is NOT set. Add it in Settings → Secrets and variables → Actions."
-            exit 1
+            echo "EIA_API_KEY is NOT set. Add it in Settings → Secrets and variables → Actions."; exit 1
+          fi
+          echo "EIA_API_KEY is present."
+
+      - name: Locate script and src (auto-detect)
+        id: locate
+        run: |
+          SCRIPT=""
+          # Prefer repo-root scripts/run_report.py
+          if [ -f scripts/run_report.py ]; then
+            SCRIPT="scripts/run_report.py"
           else
-            echo "EIA_API_KEY is present."
+            # Search nested locations
+            SCRIPT=$(find . -maxdepth 5 -path "*/scripts/run_report.py" | head -n1 || true)
           fi
 
-      - name: Validate expected files exist
-        run: |
-          test -f scripts/run_report.py || { echo "ERROR: scripts/run_report.py missing at repo root"; exit 1; }
-          test -f requirements.txt || { echo "ERROR: requirements.txt missing at repo root"; exit 1; }
-          test -f src/eia_storage_plot/fetch.py || { echo "ERROR: src/eia_storage_plot/fetch.py missing"; exit 1; }
-          test -f src/eia_storage_plot/plot.py || { echo "ERROR: src/eia_storage_plot/plot.py missing"; exit 1; }
+          if [ -z "$SCRIPT" ]; then
+            echo "ERROR: run_report.py not found in repo"; exit 1
+          fi
+
+          echo "Found script: $SCRIPT"
+          echo "script_path=$SCRIPT" >> $GITHUB_OUTPUT
+
+          # Determine src directory for PYTHONPATH
+          SRCDIR1="src"
+          SRCDIR2="$(dirname "$SCRIPT")/../src"
+          # Prefer repo-root src if present
+          if [ -d "$SRCDIR1" ]; then
+            SRCDIR="$SRCDIR1"
+          elif [ -d "$SRCDIR2" ]; then
+            SRCDIR="$SRCDIR2"
+          else
+            echo "WARNING: src/ not found at repo root or adjacent to the script."
+            SRCDIR=""
+          fi
+          echo "Using SRCDIR: $SRCDIR"
+          echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
 
       - name: Run report
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-          PYTHONPATH: ${{ github.workspace }}/src
         run: |
+          SCRIPT="${{ steps.locate.outputs.script_path }}"
+          SRCDIR="${{ steps.locate.outputs.src_path }}"
+
+          # Build PYTHONPATH
+          if [ -n "$SRCDIR" ]; then
+            export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
+          fi
+
           START="${{ github.event.inputs.start_date }}"
           END="${{ github.event.inputs.end_date }}"
           ALL="${{ github.event.inputs.all_data }}"
           if [ -z "$START" ]; then START="2024-08-01"; fi
+
           if [ "$ALL" = "true" ]; then
-            python scripts/run_report.py --start "$START" ${END:+--end "$END"} --all-data
+            python "$SCRIPT" --start "$START" ${END:+--end "$END"} --all-data
           else
-            python scripts/run_report.py --start "$START" ${END:+--end "$END"}
+            python "$SCRIPT" --start "$START" ${END:+--end "$END"}
           fi
 
       - name: Upload artifact
