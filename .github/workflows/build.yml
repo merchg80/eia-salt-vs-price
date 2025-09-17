@@ -3,18 +3,19 @@ name: Build EIA Salt vs Price
 on:
   workflow_dispatch:
     inputs:
+      # Ignored when season_last5=true, kept for manual overrides
       start_date:
-        description: 'Start date (YYYY-MM-DD)'
-        required: false
-        default: '2024-08-01'
-      end_date:
-        description: 'End date (YYYY-MM-DD)'
+        description: 'Optional override start (YYYY-MM-DD)'
         required: false
         default: ''
-      all_data:
-        description: 'Plot all returned weeks (ignore month filters)? true/false'
+      end_date:
+        description: 'Optional override end (YYYY-MM-DD)'
         required: false
-        default: 'false'
+        default: ''
+      season_last5:
+        description: 'Use last 5 completed Apr–Oct seasons (true/false)'
+        required: false
+        default: 'true'
   schedule:
     # Every Thursday at 17:30 UTC (≈ 12:30 p.m. Central during DST)
     - cron: '30 17 * * 4'
@@ -29,31 +30,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show repo tree (diagnostic)
-        run: |
-          pwd
-          ls -la
-          echo "---- up to 3 levels ----"
-          find . -maxdepth 3 -type d -print
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps (auto-detect requirements.txt)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            REQ=$(find . -maxdepth 4 -type f -name "requirements.txt" | head -n1)
-            if [ -z "$REQ" ]; then
-              echo "ERROR: requirements.txt not found anywhere in repo"; exit 1
-            fi
-            echo "Using $REQ"
-            pip install -r "$REQ"
-          fi
+          pip install -r requirements.txt
 
       - name: Check EIA_API_KEY presence
         run: |
@@ -65,30 +50,24 @@ jobs:
       - name: Locate src (prefer repo-root; exclude .github)
         id: locate
         run: |
-          # Prefer a repo-root src containing eia_storage_plot
           if [ -d src ] && [ -d src/eia_storage_plot ]; then
             SRCDIR="src"
           else
-            # Find first src that contains eia_storage_plot outside .github
             SRCDIR=$(find . -path "./.github" -prune -o -type d -name "eia_storage_plot" -print | head -n1 | xargs -r dirname | xargs -r dirname)
           fi
-
           if [ -z "$SRCDIR" ] || [ ! -d "$SRCDIR/eia_storage_plot" ]; then
             echo "ERROR: Could not find src/eia_storage_plot in repo."; exit 1
           fi
-
-          echo "Using SRCDIR: $SRCDIR"
           echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
 
-      - name: Run report (inline runner; no scripts/run_report.py needed)
+      - name: Run report (Apr–Oct last 5 completed years)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           START: ${{ github.event.inputs.start_date }}
           END: ${{ github.event.inputs.end_date }}
-          ALL_DATA: ${{ github.event.inputs.all_data }}
+          SEAS5: ${{ github.event.inputs.season_last5 }}
         run: |
           SRCDIR="${{ steps.locate.outputs.src_path }}"
-          # Build PYTHONPATH so eia_storage_plot can be imported
           export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
 
           python - <<'PYCODE'
@@ -96,30 +75,44 @@ jobs:
           import os, shutil
           from datetime import date
           from eia_storage_plot.fetch import build_weekly_join
-          from eia_storage_plot.plot import filter_windows, make_scatter
+          from eia_storage_plot.plot import select_apr_oct_last5, make_scatter
 
-          START = os.getenv("START") or "2024-08-01"
-          END = os.getenv("END") or date.today().strftime("%Y-%m-%d")
-          ALL = (os.getenv("ALL_DATA") or "false").lower() == "true"
+          # Inputs
+          start_override = os.getenv("START") or ""
+          end_override   = os.getenv("END") or ""
+          use_last5      = (os.getenv("SEAS5") or "true").lower() == "true"
 
-          print(f"[runner] start={START} end={END} all_data={ALL}")
+          today = date.today()
+          if use_last5:
+            # Use last 5 COMPLETED Apr–Oct seasons (exclude current year)
+            end_year = today.year - 1
+            start_year = end_year - 4
+            start, end = f"{start_year}-04-01", f"{end_year}-10-31"
+          else:
+            # Manual override (or fallback to last 365d)
+            if start_override and end_override:
+              start, end = start_override, end_override
+            else:
+              end = today.strftime("%Y-%m-%d")
+              start = (today.replace(year=today.year - 1)).strftime("%Y-%m-%d")
 
-          df = build_weekly_join(START, END)
+          print(f"[runner] start={start} end={end} use_last5={use_last5}")
+
+          df = build_weekly_join(start, end)
+          if use_last5:
+            df = select_apr_oct_last5(df, today=today)
 
           os.makedirs("out/data", exist_ok=True)
           os.makedirs("out/plots", exist_ok=True)
           df.to_csv("out/data/merged.csv", index=False)
 
-          plot_df = df if ALL else filter_windows(df)
-
           out_png = "out/plots/salt_vs_henryhub.png"
-          make_scatter(plot_df, out_png)
+          make_scatter(df, out_png)
 
           os.makedirs("docs/plots", exist_ok=True)
           shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
 
-          print("[runner] rows merged:", len(df))
-          print("[runner] rows plotted:", len(plot_df))
+          print("[runner] rows plotted:", len(df))
           PYCODE
 
       - name: Upload artifact
@@ -135,5 +128,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add out/data/merged.csv docs/plots/salt_vs_henryhub.png || true
-          git commit -m "CI: update data and plot [skip ci]" || echo "No changes to commit"
+          git commit -m "CI: update Apr–Oct last-5 seasons plot [skip ci]" || echo "No changes to commit"
           git push || true
