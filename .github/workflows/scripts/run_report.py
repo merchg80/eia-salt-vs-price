@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-# --- make sure src/ is on the path when running in Actions or locally ---
+# --- ensure src/ is on sys.path for imports in Actions and locally ---
 import os, sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import argparse
 from datetime import date
-import pandas as pd  # noqa: F401 (handy if you add debugging/printing)
+import pandas as pd  # noqa: F401
 
 from eia_storage_plot.fetch import build_weekly_join
 from eia_storage_plot.plot import filter_windows, make_scatter
