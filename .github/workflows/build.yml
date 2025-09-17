@@ -1,7 +1,7 @@
 name: Build EIA Salt vs Price (Apr–Oct last 10y incl 2025)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: '30 17 * * 4'  # Thursdays 17:30 UTC
 
@@ -25,35 +25,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check EIA_API_KEY presence
+      - name: Ensure EIA_API_KEY is set
         run: |
           if [ -z "${{ secrets.EIA_API_KEY }}" ]; then
-            echo "EIA_API_KEY is NOT set. Add it in Settings → Secrets and variables → Actions."; exit 1
+            echo "EIA_API_KEY is NOT set. Add it in Settings → Secrets and variables → Actions."
+            exit 1
           fi
-          echo "EIA_API_KEY is present."
 
-      - name: Locate src and set PYTHONPATH
-        id: locate
-        run: |
-          if [ -d src ] && [ -d src/eia_storage_plot ]; then
-            SRCDIR="src"
-          else
-            SRCDIR=$(find . -path "./.github" -prune -o -type d -name "eia_storage_plot" -print | head -n1 | xargs -r dirname | xargs -r dirname)
-          fi
-          if [ -z "$SRCDIR" ] || [ ! -d "$SRCDIR/eia_storage_plot" ]; then
-            echo "ERROR: Could not find src/eia_storage_plot in repo."; exit 1
-          fi
-          echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
-          # Simple, YAML-safe way to extend PYTHONPATH:
-          export ADDPATH=$(python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SRCDIR")
-          echo "ADDPATH=$ADDPATH" >> $GITHUB_OUTPUT
-
-      - name: Run report (inline Python)
+      - name: Build plots (inline Python)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-          ADDPATH: ${{ steps.locate.outputs.ADDPATH }}
         run: |
-          export PYTHONPATH="$PYTHONPATH:${ADDPATH}"
+          # Locate src/eia_storage_plot and set PYTHONPATH
+          if [ -d src/eia_storage_plot ]; then
+            SRCDIR="src"
+          else
+            SRCDIR=$(dirname "$(dirname "$(find . -path "./.github" -prune -o -type d -name "eia_storage_plot" -print | head -n1)")")
+          fi
+          if [ -z "$SRCDIR" ] || [ ! -d "$SRCDIR/eia_storage_plot" ]; then
+            echo "ERROR: Could not find src/eia_storage_plot in repo."
+            find . -maxdepth 3 -type d -name "eia_storage_plot" -print
+            exit 1
+          fi
+          ADDPATH=$(python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SRCDIR")
+          export PYTHONPATH="$PYTHONPATH:$ADDPATH"
+
           python - <<'PYCODE'
 from __future__ import annotations
 import os, shutil
