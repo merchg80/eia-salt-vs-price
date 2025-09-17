@@ -2,30 +2,33 @@ from __future__ import annotations
 import os
 import time
 import io
+import itertools
 import requests
 import pandas as pd
 
 EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
-# ---- API endpoints ----
+# ---- API (primary) ----
 SERIES_URL_V1 = "https://api.eia.gov/series/?api_key={key}&series_id={sid}"
 
 # v1 Series IDs
-SID_SALT_WEEKLY   = "NG.W_EPG0_SSO_NUS_DW"   # South Central Salt, weekly, Bcf (may 404 intermittently)
-SID_US_TOTAL_WEEK = "NG.W_EPG0_SWO_NUS_DW"   # U.S./Lower 48 total working gas, weekly, Bcf
-SID_HENRY_DAILY   = "NG.RNGWHHD.D"           # Henry Hub daily spot price, $/MMBtu
+SID_SALT_WEEKLY   = "NG.W_EPG0_SSO_NUS_DW"   # South Central Salt, weekly (Bcf)
+SID_US_TOTAL_WEEK = "NG.W_EPG0_SWO_NUS_DW"   # U.S./Lower 48 Total, weekly (Bcf)
+SID_HENRY_DAILY   = "NG.RNGWHHD.D"           # Henry Hub daily spot ($/MMBtu)
 
-# ---- Direct XLS fallbacks (same data, from EIA "View History → Download Data (XLS)") ----
-# Salt (South Central): https://www.eia.gov/dnav/ng/hist/nw2_epg0_sso_r33_bcfw.htm
+# ---- XLS fallbacks (direct from EIA 'View History' pages) ----
 XLS_SALT_WEEKLY   = "https://www.eia.gov/dnav/ng/hist_xls/NW2_EPG0_SSO_R33_BCFw.xls"
-# Lower 48 Total: https://www.eia.gov/dnav/ng/hist/nw2_epg0_swo_r48_bcfw.htm
 XLS_US_TOTAL_WEEK = "https://www.eia.gov/dnav/ng/hist_xls/NW2_EPG0_SWO_R48_BCFw.xls"
-# Henry Hub daily: https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm
 XLS_HENRY_DAILY   = "https://www.eia.gov/dnav/ng/hist_xls/rngwhhdd.xls"
+
+# ---- HTML fallbacks (parse the on-page tables) ----
+HTML_SALT_WEEKLY   = "https://www.eia.gov/dnav/ng/hist/nw2_epg0_sso_r33_bcfw.htm"
+HTML_US_TOTAL_WEEK = "https://www.eia.gov/dnav/ng/hist/nw2_epg0_swo_r48_bcfw.htm"
+HTML_HENRY_DAILY   = "https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm"
 
 
 # =======================================================================================
-# HTTP helpers
+# HTTP helper
 # =======================================================================================
 
 def _http_get(url: str, retries: int = 6, backoff_base: float = 1.7, stream: bool = False) -> requests.Response:
@@ -60,7 +63,6 @@ def _http_get(url: str, retries: int = 6, backoff_base: float = 1.7, stream: boo
 def _df_from_v1_series(resp_json: dict) -> pd.DataFrame:
     """
     Parse EIA v1 /series response into DataFrame with columns: period (datetime), value (float).
-    Schema: {"series": [{"data": [["2025-09-12", 2.34], ...]}]}
     """
     series = resp_json.get("series", [])
     if not series:
@@ -70,27 +72,69 @@ def _df_from_v1_series(resp_json: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=["period", "value"])
     df = pd.DataFrame(data, columns=["period", "value"])
     df["period"] = pd.to_datetime(df["period"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["value"]  = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["period"]).sort_values("period").reset_index(drop=True)
     return df[["period", "value"]]
 
 
 def _df_from_hist_xls(binary: bytes) -> pd.DataFrame:
     """
-    Parse EIA 'hist_xls' files (Date/Value in first two columns; ignore headers/notes).
-    Uses xlrd engine for .xls support.
+    Parse legacy EIA .xls files:
+      - load first sheet (no header),
+      - choose the best date+value columns pair,
+      - coerce and return ascending.
     """
-    with io.BytesIO(binary) as buf:
-        raw = pd.read_excel(buf, sheet_name=0, header=None, engine="xlrd")
-    if raw.shape[1] < 2:
-        raw = pd.read_excel(io.BytesIO(binary), sheet_name=0, header=None, engine="xlrd")
-    df = raw.iloc[:, :2].copy()
-    df.columns = ["period_raw", "value_raw"]
-    df["period"] = pd.to_datetime(df["period_raw"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value_raw"], errors="coerce")
-    df = df.dropna(subset=["period"]).dropna(subset=["value"])
-    df = df[["period", "value"]].sort_values("period").reset_index(drop=True)
-    return df
+    raw = pd.read_excel(io.BytesIO(binary), sheet_name=0, header=None, engine="xlrd")
+
+    # Try to auto-detect the best (date_col, value_col) pair
+    best = None  # (score, df)
+    ncols = raw.shape[1]
+    for date_idx, val_idx in itertools.product(range(ncols), repeat=2):
+        if date_idx == val_idx:
+            continue
+        d = pd.DataFrame({"period": pd.to_datetime(raw.iloc[:, date_idx], errors="coerce"),
+                          "value":  pd.to_numeric(raw.iloc[:, val_idx], errors="coerce")})
+        d = d.dropna(subset=["period", "value"])
+        score = len(d)
+        if score >= 10:  # enough points to be plausible
+            d = d.sort_values("period").reset_index(drop=True)
+            best = (score, d) if (best is None or score > best[0]) else best
+    if best is None:
+        # Fallback: assume first two columns
+        d = pd.DataFrame({"period": pd.to_datetime(raw.iloc[:, 0], errors="coerce"),
+                          "value":  pd.to_numeric(raw.iloc[:, 1], errors="coerce")})
+        d = d.dropna(subset=["period", "value"]).sort_values("period").reset_index(drop=True)
+        return d[["period", "value"]]
+    return best[1][["period", "value"]]
+
+
+def _df_from_hist_html(url: str) -> pd.DataFrame:
+    """
+    Parse EIA history pages by reading HTML tables and selecting the best date/value column pair.
+    Requires lxml (installed via requirements).
+    """
+    tables = pd.read_html(url)  # returns list[DataFrame]
+    best = None  # (score, df)
+    for t in tables:
+        # Normalize headers away; treat everything as raw
+        t = t.copy()
+        t.columns = [str(c) for c in range(t.shape[1])]
+        ncols = t.shape[1]
+        for date_idx, val_idx in itertools.product(range(ncols), repeat=2):
+            if date_idx == val_idx:
+                continue
+            dfc = pd.DataFrame({
+                "period": pd.to_datetime(t.iloc[:, date_idx], errors="coerce"),
+                "value":  pd.to_numeric(t.iloc[:, val_idx], errors="coerce")
+            })
+            dfc = dfc.dropna(subset=["period", "value"])
+            score = len(dfc)
+            if score >= 10:
+                dfc = dfc.sort_values("period").reset_index(drop=True)
+                best = (score, dfc) if (best is None or score > best[0]) else best
+    if best is None:
+        return pd.DataFrame(columns=["period", "value"])
+    return best[1][["period", "value"]]
 
 
 def _clip(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
@@ -99,7 +143,7 @@ def _clip(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
 
 
 # =======================================================================================
-# Fetchers with layered fallbacks: v1 /series  → hist_xls
+# Fetchers with layered fallbacks: v1 /series → XLS → HTML
 # =======================================================================================
 
 def _fetch_series_v1(series_id: str) -> pd.DataFrame:
@@ -114,40 +158,50 @@ def _fetch_hist_xls(url: str) -> pd.DataFrame:
         content = r.content
     return _df_from_hist_xls(content)
 
-def _try_v1_then_xls(series_id: str, xls_url: str, label: str) -> pd.DataFrame:
-    # Try v1 first
+def _try_v1_then_xls_then_html(series_id: str, xls_url: str, html_url: str, label: str) -> pd.DataFrame:
+    # 1) v1 /series
     try:
         df = _fetch_series_v1(series_id)
         if not df.empty:
             print(f"[OK] {label}: v1 /series returned {len(df)} rows")
             return df
-        print(f"[WARN] {label}: v1 /series returned no rows; falling back to XLS")
+        print(f"[WARN] {label}: v1 /series returned no rows; trying XLS")
     except Exception as e:
-        print(f"[WARN] {label}: v1 /series failed: {e}; falling back to XLS")
+        print(f"[WARN] {label}: v1 /series failed: {e}; trying XLS")
 
-    # Fallback to XLS
-    df_x = _fetch_hist_xls(xls_url)
-    if df_x.empty:
-        raise RuntimeError(f"{label}: XLS fallback returned no rows")
-    print(f"[OK] {label}: XLS fallback returned {len(df_x)} rows")
-    return df_x
+    # 2) XLS
+    try:
+        df_x = _fetch_hist_xls(xls_url)
+        if not df_x.empty:
+            print(f"[OK] {label}: XLS fallback returned {len(df_x)} rows")
+            return df_x
+        print(f"[WARN] {label}: XLS fallback returned no rows; trying HTML")
+    except Exception as e:
+        print(f"[WARN] {label}: XLS fallback failed: {e}; trying HTML")
+
+    # 3) HTML
+    df_h = _df_from_hist_html(html_url)
+    if df_h.empty:
+        raise RuntimeError(f"{label}: All sources failed (v1/XLS/HTML).")
+    print(f"[OK] {label}: HTML fallback returned {len(df_h)} rows")
+    return df_h
 
 
 def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
     """South Central 'Salt' weekly storage (Bcf)."""
-    df = _try_v1_then_xls(SID_SALT_WEEKLY, XLS_SALT_WEEKLY, "South Central SALT weekly")
+    df = _try_v1_then_xls_then_html(SID_SALT_WEEKLY, XLS_SALT_WEEKLY, HTML_SALT_WEEKLY, "South Central SALT weekly")
     df = _clip(df, start, end).rename(columns={"value": "salt_bcf"})
     return df[["period", "salt_bcf"]]
 
 def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
     """U.S./Lower 48 Total weekly storage (Bcf)."""
-    df = _try_v1_then_xls(SID_US_TOTAL_WEEK, XLS_US_TOTAL_WEEK, "U.S. TOTAL weekly")
+    df = _try_v1_then_xls_then_html(SID_US_TOTAL_WEEK, XLS_US_TOTAL_WEEK, HTML_US_TOTAL_WEEK, "U.S. TOTAL weekly")
     df = _clip(df, start, end).rename(columns={"value": "us_bcf"})
     return df[["period", "us_bcf"]]
 
 def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
     """Henry Hub daily spot price ($/MMBtu)."""
-    df = _try_v1_then_xls(SID_HENRY_DAILY, XLS_HENRY_DAILY, "Henry Hub daily")
+    df = _try_v1_then_xls_then_html(SID_HENRY_DAILY, XLS_HENRY_DAILY, HTML_HENRY_DAILY, "Henry Hub daily")
     df = _clip(df, start, end).rename(columns={"value": "henryhub"})
     return df[["period", "henryhub"]]
 
@@ -160,9 +214,8 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     """
     Merge weekly SALT + U.S. Total with Henry Hub daily (resampled to W-FRI).
     """
-    # API key is only needed for v1 /series; XLS fallbacks work without it.
     if not EIA_API_KEY:
-        print("[INFO] EIA_API_KEY not set; will use XLS fallbacks as needed.")
+        print("[INFO] EIA_API_KEY not set; will use XLS/HTML fallbacks as needed.")
 
     salt = fetch_salt_weekly(start, end)
     us   = fetch_us_total_weekly(start, end)
