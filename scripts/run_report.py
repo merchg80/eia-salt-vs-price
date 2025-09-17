@@ -7,21 +7,19 @@ from datetime import date
 
 from eia_storage_plot.fetch import build_weekly_join
 from eia_storage_plot.plot import (
-    select_apr_oct_last5_including_current,
+    select_apr_oct_since_2017_including_current,
     make_scatter_salt_vs_price,
     make_scatter_us_total_vs_price,
 )
 
 def main():
     today = date.today()
-    # Last 5 years window INCLUDING current year (e.g., includes 2025)
-    start_year = today.year - 4
-    end_year = today.year
-    start, end = f"{start_year}-04-01", f"{end_year}-10-31"
-    print(f"[runner] Using Apr–Oct last 5 years incl. current: {start} → {end}")
+    # Apr–Oct from 2017 through current year (e.g., includes 2025)
+    start, end = "2017-04-01", f"{today.year}-10-31"
+    print(f"[runner] Using Apr–Oct 2017–{today.year}: {start} → {end}")
 
     df = build_weekly_join(start, end)
-    df = select_apr_oct_last5_including_current(df, today=today)
+    df = select_apr_oct_since_2017_including_current(df, today=today)
 
     os.makedirs("out/data", exist_ok=True)
     os.makedirs("out/plots", exist_ok=True)
