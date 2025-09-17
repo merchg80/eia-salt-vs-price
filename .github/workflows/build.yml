@@ -29,6 +29,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show repo tree (diagnostic)
+        run: |
+          pwd
+          ls -la
+          echo "---- up to 3 levels ----"
+          find . -maxdepth 3 -type d -print
+          echo "---- any run_report.py? ----"
+          find . -maxdepth 5 -type f -name "run_report.py" -print
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -47,6 +56,13 @@ jobs:
           else
             echo "EIA_API_KEY is present."
           fi
+
+      - name: Validate expected files exist
+        run: |
+          test -f scripts/run_report.py || { echo "ERROR: scripts/run_report.py missing at repo root"; exit 1; }
+          test -f requirements.txt || { echo "ERROR: requirements.txt missing at repo root"; exit 1; }
+          test -f src/eia_storage_plot/fetch.py || { echo "ERROR: src/eia_storage_plot/fetch.py missing"; exit 1; }
+          test -f src/eia_storage_plot/plot.py || { echo "ERROR: src/eia_storage_plot/plot.py missing"; exit 1; }
 
       - name: Run report
         env:
