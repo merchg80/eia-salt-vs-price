@@ -130,7 +130,7 @@ def _scatter_with_quadratic_and_options(
     # Plot
     fig, ax = plt.subplots(figsize=(9.5, 6.5))
 
-    # Pre-2025 points
+    # Non-2025 points
     ax.scatter(
         trimmed.loc[not_2025, x_col],
         trimmed.loc[not_2025, y_col],
