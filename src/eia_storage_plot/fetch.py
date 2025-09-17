@@ -66,7 +66,10 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     us = fetch_us_total_weekly(start, end)
     hh = fetch_henry_hub_daily(start, end)
     if salt.empty or us.empty or hh.empty:
-        raise RuntimeError("One or more EIA endpoints returned no data. Check EIA_API_KEY and date range.")
+        raise RuntimeError(
+            "One or more EIA endpoints returned no data. "
+            "Verify EIA_API_KEY (repo secret), the date range, and that the endpoints are reachable."
+        )
     # Weekly avg price aligned to Friday (EIA storage week ending)
     hh_w = (
         hh.set_index("period")
