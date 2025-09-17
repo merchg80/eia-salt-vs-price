@@ -1,7 +1,11 @@
 from __future__ import annotations
-import os, requests, pandas as pd
+import os
+import requests
+import pandas as pd
 
 EIA_API_KEY = os.getenv("EIA_API_KEY", "")
+
+# EIA API v2 endpoints
 STORAGES_URL = "https://api.eia.gov/v2/natural-gas/storages/data/"
 HENRY_HUB_URL = "https://api.eia.gov/v2/natural-gas/pri/dpr/data/"
 
@@ -22,6 +26,7 @@ def _df_from_v2(resp: dict) -> pd.DataFrame:
     return df
 
 def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
+    """South Central 'Salt' weekly storage (Bcf)."""
     url = (
         f"{STORAGES_URL}?api_key={EIA_API_KEY}"
         "&frequency=weekly&sort[0][column]=period&sort[0][direction]=asc"
@@ -33,6 +38,7 @@ def fetch_salt_weekly(start: str, end: str) -> pd.DataFrame:
     return df[["period", "salt_bcf"]]
 
 def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
+    """U.S. Total working gas weekly (Bcf)."""
     url = (
         f"{STORAGES_URL}?api_key={EIA_API_KEY}"
         "&frequency=weekly&sort[0][column]=period&sort[0][direction]=asc"
@@ -44,6 +50,7 @@ def fetch_us_total_weekly(start: str, end: str) -> pd.DataFrame:
     return df[["period", "us_bcf"]]
 
 def fetch_henry_hub_daily(start: str, end: str) -> pd.DataFrame:
+    """Henry Hub daily price (USD/MMBtu), to be resampled weekly."""
     url = (
         f"{HENRY_HUB_URL}?api_key={EIA_API_KEY}"
         "&frequency=daily&sort[0][column]=period&sort[0][direction]=asc"
@@ -59,13 +66,12 @@ def build_weekly_join(start: str, end: str) -> pd.DataFrame:
     us = fetch_us_total_weekly(start, end)
     hh = fetch_henry_hub_daily(start, end)
     if salt.empty or us.empty or hh.empty:
-        raise RuntimeError("EIA endpoints returned no data for the given range.")
-
+        raise RuntimeError("One or more EIA endpoints returned no data. Check EIA_API_KEY and date range.")
+    # Weekly avg price aligned to Friday (EIA storage week ending)
     hh_w = (
         hh.set_index("period")
           .resample("W-FRI")
           .mean()
           .reset_index()
     )
-
     return salt.merge(us, on="period", how="inner").merge(hh_w, on="period", how="inner")
