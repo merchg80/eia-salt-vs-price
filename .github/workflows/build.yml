@@ -15,6 +15,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show repo layout (debug)
+        run: |
+          pwd
+          ls -la
+          echo "----"
+          find . -maxdepth 3 -type f | sort
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -32,7 +39,7 @@ jobs:
           fi
           echo "EIA_API_KEY is present."
 
-      - name: Locate src
+      - name: Locate src and set PYTHONPATH
         id: locate
         run: |
           if [ -d src ] && [ -d src/eia_storage_plot ]; then
@@ -45,13 +52,54 @@ jobs:
           fi
           echo "src_path=$SRCDIR" >> $GITHUB_OUTPUT
 
-      - name: Run report (Apr–Oct last 10 years incl. 2025)
+      - name: Run report (inline Python)
         env:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
           SRCDIR="${{ steps.locate.outputs.src_path }}"
-          export PYTHONPATH="$PYTHONPATH:$(python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SRCDIR")"
-          python scripts/run_report.py
+          export PYTHONPATH="$PYTHONPATH:$(python - <<'PY'
+import os,sys
+print(os.path.realpath(sys.argv[1]))
+PY
+"$SRCDIR")"
+
+          python - <<'PYCODE'
+from __future__ import annotations
+import os, shutil
+from datetime import date
+
+from eia_storage_plot.fetch import build_weekly_join
+from eia_storage_plot.plot import (
+    select_apr_oct_last10_including_current,
+    make_scatter_salt_vs_price,
+    make_scatter_us_total_vs_price,
+)
+
+today = date.today()
+start_year = today.year - 9
+end_year = today.year
+start, end = f"{start_year}-04-01", f"{end_year}-10-31"
+print(f"[runner] Using Apr–Oct last 10 years incl. current: {start} → {end}")
+
+df = build_weekly_join(start, end)
+df = select_apr_oct_last10_including_current(df, today=today)
+
+os.makedirs("out/data", exist_ok=True)
+os.makedirs("out/plots", exist_ok=True)
+df.to_csv("out/data/merged.csv", index=False)
+
+salt_png = "out/plots/salt_vs_henryhub.png"
+us_png   = "out/plots/us_total_vs_henryhub.png"
+
+make_scatter_salt_vs_price(df, salt_png, today=today)
+make_scatter_us_total_vs_price(df, us_png, today=today)
+
+os.makedirs("docs/plots", exist_ok=True)
+shutil.copyfile(salt_png, "docs/plots/salt_vs_henryhub.png")
+shutil.copyfile(us_png, "docs/plots/us_total_vs_henryhub.png")
+
+print("[runner] rows plotted:", len(df))
+PYCODE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
