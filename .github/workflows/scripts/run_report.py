@@ -1,46 +1,50 @@
 from __future__ import annotations
 
-# --- ensure src/ is on sys.path for imports in Actions and locally ---
 import os, sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import argparse
 from datetime import date
-import pandas as pd  # noqa: F401
 
 from eia_storage_plot.fetch import build_weekly_join
-from eia_storage_plot.plot import filter_windows, make_scatter
-
-DEFAULT_START = "2024-08-01"
-DEFAULT_END = date.today().strftime("%Y-%m-%d")
+from eia_storage_plot.plot import select_apr_oct_last5, make_scatter
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Build EIA salt vs Henry Hub weekly scatterplot.")
-    p.add_argument("--start", default=DEFAULT_START, help="YYYY-MM-DD inclusive (default: 2024-08-01)")
-    p.add_argument("--end", default=DEFAULT_END, help="YYYY-MM-DD inclusive (default: today)")
-    p.add_argument("--all-data", action="store_true", help="Skip month filtering; plot all returned weeks.")
+    p = argparse.ArgumentParser(description="Build Apr–Oct last-5-year EIA salt vs Henry Hub scatterplot.")
+    p.add_argument("--season-last5", action="store_true", help="Use last 5 completed Apr–Oct seasons (default).")
+    p.add_argument("--start", help="Override start YYYY-MM-DD (ignored when --season-last5).")
+    p.add_argument("--end", help="Override end YYYY-MM-DD (ignored when --season-last5).")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    start, end = args.start, args.end
-    df = build_weekly_join(start, end)
+    today = date.today()
+
+    if args.season_last5 or (not args.start and not args.end):
+        end_year = today.year - 1
+        start_year = end_year - 4
+        start, end = f"{start_year}-04-01", f"{end_year}-10-31"
+        print(f"[runner] Using last 5 completed Apr–Oct seasons: {start} → {end}")
+        df = build_weekly_join(start, end)
+        df = select_apr_oct_last5(df, today=today)
+    else:
+        start = args.start
+        end = args.end or today.strftime("%Y-%m-%d")
+        print(f"[runner] Using manual window: {start} → {end}")
+        df = build_weekly_join(start, end)
 
     os.makedirs("out/data", exist_ok=True)
     os.makedirs("out/plots", exist_ok=True)
     df.to_csv("out/data/merged.csv", index=False)
 
-    plot_df = df if args.all_data else filter_windows(df)
-
     out_png = "out/plots/salt_vs_henryhub.png"
-    make_scatter(plot_df, out_png)
-    os.makedirs("docs/plots", exist_ok=True)
+    make_scatter(df, out_png)
 
+    os.makedirs("docs/plots", exist_ok=True)
     import shutil
     shutil.copyfile(out_png, "docs/plots/salt_vs_henryhub.png")
 
-    print("Rows merged:", len(df))
-    print("Rows plotted:", len(plot_df))
+    print("Rows plotted:", len(df))
 
 if __name__ == "__main__":
     main()
